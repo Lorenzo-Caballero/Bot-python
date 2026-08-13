@@ -60,6 +60,9 @@ URL_USUARIOS = "https://agents.ganamosonline.com/users/all"
 _CONT = "#root > div > div.app__wrapper > main > div.app__wrapper__content"
 
 SEL_BUSCAR = [
+    # El placeholder es lo mas estable que tiene esta pantalla: sobrevive al
+    # cambio de layout y a los reacomodos del markup.
+    'input[placeholder="Buscar Usuario"]',
     f"{_CONT} > div.users > div.users__filter > form > div:nth-child(1) > "
     "div.search-user-input > div > input",
     f"{_CONT} > div > div.users-mobile__search > div > div:nth-child(1) > "
@@ -67,8 +70,17 @@ SEL_BUSCAR = [
     ".search-user-input input",
 ]
 
-# Desplegable de coincidencias. En varias pantallas la tabla NO filtra sola:
-# recien se acomoda cuando se elige una opcion de aca.
+# EL PASO QUE FALTABA. Tipear en el buscador no filtra nada: la tabla se entera
+# recien cuando se aprieta "Aplicar Filtro". Sin esto, la primera fila sigue
+# siendo la del jugador que ya estaba y el bot concluye que el usuario no existe.
+SEL_APLICAR = [
+    "button:has-text('Aplicar Filtro')",
+    "a:has-text('Aplicar Filtro')",
+    "[class*='filter'] button:has-text('Aplicar')",
+    "button:has-text('Aplicar')",
+]
+
+# Desplegable de coincidencias mientras se tipea, cuando lo hay.
 SEL_SUGERENCIA = [
     ".search-user-input__search-results > div",
 ]
@@ -245,15 +257,29 @@ def buscar(page, usuario: str, timeout_s: float = 15.0):
     # El panel aclara "introducir texto solo en minusculas" al lado del campo.
     caja.type(usuario.lower(), delay=50)
 
-    # El desplegable de coincidencias: en varias pantallas la tabla NO filtra
-    # hasta que se elige una opcion. Si no lo clickeamos, la primera fila sigue
-    # siendo la de otro jugador y esto termina en "no lo encontre".
-    sug = primero(page, SEL_SUGERENCIA, 6_000)
+    # Si aparece el desplegable de coincidencias, elegir la opcion ya deja el
+    # filtro puesto y ahorra el paso siguiente.
+    sug = primero(page, SEL_SUGERENCIA, 3_000)
     if sug is not None:
         try:
             sug.click(timeout=4_000)
         except (PWTimeout, PWError) as e:
             log.info("  la sugerencia no se dejo clickear (%s), sigo igual", e)
+
+    # "Aplicar Filtro": sin esto la tabla ni se entera de lo que tipeamos.
+    aplicar = primero(page, SEL_APLICAR, 4_000)
+    if aplicar is not None:
+        try:
+            aplicar.click(timeout=6_000)
+        except (PWTimeout, PWError) as e:
+            log.warning("  no pude apretar 'Aplicar Filtro': %s", e)
+    else:
+        # En escritorio el buscador vive dentro de un <form>: Enter lo envia.
+        log.info("  no vi 'Aplicar Filtro', pruebo con Enter")
+        try:
+            caja.press("Enter", timeout=4_000)
+        except (PWTimeout, PWError):
+            pass
 
     limite = time.monotonic() + timeout_s
     visto = ""
@@ -266,6 +292,11 @@ def buscar(page, usuario: str, timeout_s: float = 15.0):
         page.wait_for_timeout(300)
 
     log.warning("  la primera fila quedo en '%s', no en '%s'", visto or "(vacia)", usuario)
+    # Sin esto hay que adivinar si fallo el filtro, la busqueda o el layout.
+    try:
+        page.screenshot(path=str(bot.SHOTS / f"fichas_sin_fila_{usuario}.png"))
+    except (PWTimeout, PWError):
+        pass
     return None
 
 
