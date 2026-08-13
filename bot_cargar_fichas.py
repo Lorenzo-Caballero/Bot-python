@@ -112,7 +112,8 @@ SEL_DEP_MONTO = [
     f"{_CONT} > div > div > div.deposit__top > div.deposit__inputs > "
     "div:nth-child(1) > div > div > div > div > input",
     f"{_CONT} > div > div.deposit-mobile__inputs > div:nth-child(1) > "
-    "div > div > div > input",
+    "div > div > div > div > input",
+    'input[placeholder="Cantidad"]',
     '[class*="deposit"][class*="inputs"] input',
 ]
 
@@ -216,6 +217,42 @@ def montos_de(texto: str) -> list[float]:
         except ValueError:
             pass
     return montos
+
+
+def poner_monto(page, caja, monto: float) -> str:
+    """Escribe el monto y VERIFICA releyendo el campo.
+
+    Devuelve "" si quedo bien, o el motivo si no.
+
+    Se relee a proposito: es un input controlado por React y hay pantallas donde
+    el type() no dispara el onChange, asi que el campo queda vacio aunque las
+    teclas hayan llegado. Apretar "Depositar" con el campo vacio -o con la mitad
+    del numero- es plata mal puesta, y no se deshace.
+    """
+    texto = str(int(monto)) if float(monto).is_integer() else str(monto)
+    leido = ""
+
+    # Dos formas distintas: type() manda teclas de verdad (lo que mas se parece
+    # a una persona) y fill() setea el valor y dispara el evento a mano.
+    for metodo in ("type", "fill"):
+        try:
+            caja.click(timeout=5_000)
+            caja.fill("")
+            if metodo == "type":
+                caja.type(texto, delay=60)
+            else:
+                caja.fill(texto)
+            page.wait_for_timeout(400)
+
+            leido = (caja.input_value(timeout=3_000) or "").strip()
+            # El campo puede formatear solo: "1.000", "1,000", "1000".
+            if montos_de(leido)[:1] == [float(monto)]:
+                return ""
+            log.info("  el campo quedo en '%s' con %s(), reintento", leido, metodo)
+        except (PWTimeout, PWError) as e:
+            log.info("  fallo %s() en el campo del monto: %s", metodo, e)
+
+    return f"el campo del monto quedo en '{leido}', no en '{texto}'"
 
 
 def nombre_de_fila(page, fila) -> str:
@@ -357,14 +394,15 @@ def cargar_en_panel(page, usuario: str, monto: float) -> tuple[str, str]:
         page.screenshot(path=str(bot.SHOTS / f"fichas_sin_input_{usuario}.png"))
         return "error", "No encontre el campo del monto en la pantalla de deposito"
 
-    caja.click()
-    caja.fill("")
-    # Entero si es entero: algunos campos rechazan el punto decimal.
-    caja.type(str(int(monto)) if float(monto).is_integer() else str(monto), delay=50)
+    problema = poner_monto(page, caja, monto)
+    if problema:
+        page.screenshot(path=str(bot.SHOTS / f"fichas_monto_{usuario}.png"))
+        # Nada que revisar: no se llego a apretar Depositar, no se movio un peso.
+        return "error", problema
 
     if MODO != "LIVE":
         page.screenshot(path=str(bot.SHOTS / f"dryrun_fichas_{usuario}.png"))
-        return "dry-run", f"[DRY_RUN] formulario listo con {monto} para {usuario}, NO se envio"
+        return "dry-run", f"[DRY_RUN] campo cargado con {monto:g} para {usuario}, NO se envio"
 
     confirmar = primero(page, SEL_DEP_CONFIRMAR, 10_000)
     if confirmar is None:
