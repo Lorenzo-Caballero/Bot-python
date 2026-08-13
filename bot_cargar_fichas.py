@@ -85,6 +85,22 @@ SEL_SUGERENCIA = [
     ".search-user-input__search-results > div",
 ]
 
+# En mobile el panel de filtros viene plegado y el buscador no se ve hasta
+# abrirlo con "Mostrar".
+SEL_ABRIR_FILTRO = [
+    "button:has-text('Mostrar')",
+    "a:has-text('Mostrar')",
+    "[class*='filter'] [class*='toggle']",
+]
+
+# Saldo del jugador EN LA PANTALLA DE DEPOSITO. Ahi figuran dos saldos: el del
+# AGENTE (tarjeta "De") y el del jugador (tarjeta "A"). Leer el que no es
+# significa comparar contra 1.462,50 en vez de contra 0.
+#
+# TODO: falta el selector exacto de la tarjeta "A". Mientras tanto se resuelve
+# buscando el bloque que contiene el nombre del jugador (ver saldo_en_deposito).
+SEL_SALDO_JUGADOR = []
+
 # La tabla no es <table>, son divs. Solo se mira la PRIMERA fila.
 SEL_FILA = [
     f"{_CONT} > div.users > div.users-table.users-table_tab_all > "
@@ -134,6 +150,10 @@ RX_MODAL_DEPOSITO = re.compile(r"^\s*(dep[oó]sito|depositar|confirmar|aceptar|s
 # Es la confirmacion de que se abrio la pantalla del jugador correcto.
 RX_URL_DEPOSITO = re.compile(r"/user/deposit/(\d+)")
 
+# Saldo del jugador antes y despues del ultimo deposito. Lo llena
+# cargar_en_panel() y lo lee procesar_pendientes() para mandarlo a la base.
+ULTIMO_SALDO = {"antes": None, "despues": None}
+
 MODO = os.environ.get("FICHAS_MODE", "DRY_RUN").upper()
 POLL = int(os.environ.get("FICHAS_POLL_SEGUNDOS", 20))
 
@@ -167,12 +187,21 @@ class ApiAcciones:
         r.raise_for_status()
         return r.json().get("datos", [])
 
-    def marcar(self, accion_id: int, estado: str, mensaje: str = "") -> None:
-        """estado: 'hecha' | 'error' (devuelve las fichas) | 'revisar' (no devuelve)."""
+    def marcar(self, accion_id: int, estado: str, mensaje: str = "",
+               saldo_antes=None, saldo_despues=None) -> None:
+        """estado: 'hecha' | 'error' (devuelve las fichas) | 'revisar' (no devuelve).
+
+        Los saldos van a la base para que quede el comprobante de la carga: sin
+        eso, para saber si una accion realmente acredito hay que entrar al panel.
+        """
+        cuerpo = {"id": accion_id, "estado": estado, "mensaje": mensaje[:300]}
+        if saldo_antes is not None:
+            cuerpo["saldo_antes"] = saldo_antes
+        if saldo_despues is not None:
+            cuerpo["saldo_despues"] = saldo_despues
         try:
             r = self.s.post(self.url, params={"accion": "marcar"},
-                            json={"id": accion_id, "estado": estado, "mensaje": mensaje[:300]},
-                            timeout=25)
+                            json=cuerpo, timeout=25)
             r.raise_for_status()
         except requests.RequestException as e:
             # Si esto falla, la accion queda 'procesando' y a los 15 min el
@@ -262,6 +291,57 @@ def poner_monto(page, caja, monto: float) -> str:
     return f"el campo del monto quedo en '{leido}', no en '{texto}'"
 
 
+def saldo_agente_en_deposito(page):
+    """El saldo del AGENTE en la pantalla de deposito (la tarjeta "De").
+
+    Es el primer "Saldo" del texto, porque esa tarjeta va antes que la del
+    jugador. Sirve para no intentar una carga que el agente no puede pagar: el
+    panel la rechaza y el bot solo ve que el saldo del jugador no se movio.
+    """
+    try:
+        texto = page.locator(_CONT).first.inner_text(timeout=5_000) or ""
+    except (PWTimeout, PWError):
+        return None
+    m = re.search(r"[Ss]aldo\s*:?\s*(-?[\d.,]+)", texto)
+    if not m:
+        return None
+    montos = montos_de(m.group(1))
+    return montos[0] if montos else None
+
+
+def saldo_en_deposito(page, usuario: str):
+    """El saldo del JUGADOR leido en la pantalla de deposito. None si no se pudo.
+
+    En esa pantalla hay dos saldos: el del agente (tarjeta "De") y el del
+    jugador (tarjeta "A"). Se ubica el nombre del jugador en el texto y se toma
+    el primer "Saldo" que aparezca DESPUES: la tarjeta del agente esta antes, y
+    leerla seria comparar contra 1.462,50 en vez de contra 0.
+    """
+    for sel in SEL_SALDO_JUGADOR:
+        try:
+            loc = page.locator(sel)
+            if loc.count() > 0:
+                m = montos_de(loc.first.inner_text(timeout=3_000))
+                if m:
+                    return m[0]
+        except (PWTimeout, PWError):
+            pass
+
+    try:
+        texto = page.locator(_CONT).first.inner_text(timeout=5_000) or ""
+    except (PWTimeout, PWError):
+        return None
+
+    i = texto.lower().find(usuario.lower())
+    if i == -1:
+        return None
+    m = re.search(r"[Ss]aldo\s*:?\s*(-?[\d.,]+)", texto[i:])
+    if not m:
+        return None
+    montos = montos_de(m.group(1))
+    return montos[0] if montos else None
+
+
 def nombre_de_fila(page, fila) -> str:
     """El nombre de usuario de una fila, sin la etiqueta PLAYER ni el saldo."""
     for sel in SEL_NOMBRE_EN_FILA:
@@ -344,15 +424,40 @@ def buscar(page, usuario: str, timeout_s: float = 15.0):
     return None
 
 
-def ir_a_usuarios(page) -> None:
-    if URL_USUARIOS.rstrip("/") not in page.url.rstrip("/"):
+def ir_a_usuarios(page, intentos: int = 2) -> None:
+    """Deja la pagina parada en el listado, con el buscador usable.
+
+    Siempre goto(), nunca reload(): despues de un deposito la pagina puede
+    quedar con un modal encima o a mitad de una navegacion, y recargar eso
+    reproduce el mismo estado roto. Volver a entrar por la URL lo limpia.
+    """
+    ultimo = ""
+    for intento in range(intentos):
         page.goto(URL_USUARIOS, wait_until="domcontentloaded")
-    else:
-        page.reload(wait_until="domcontentloaded")
-    if bot.es_pantalla_login(page):
-        raise bot.SesionExpirada(page.url)
-    if primero(page, SEL_BUSCAR, 20_000) is None:
-        raise PWTimeout("No cargo el listado de usuarios del panel")
+        if bot.es_pantalla_login(page):
+            raise bot.SesionExpirada(page.url)
+
+        if primero(page, SEL_BUSCAR, 15_000) is not None:
+            return
+
+        # El buscador existe pero esta plegado: en mobile el filtro viene
+        # cerrado y hay que abrirlo con "Mostrar" antes de poder tipear.
+        abrir = primero(page, SEL_ABRIR_FILTRO, 3_000)
+        if abrir is not None:
+            try:
+                abrir.click(timeout=5_000)
+                if primero(page, SEL_BUSCAR, 8_000) is not None:
+                    return
+            except (PWTimeout, PWError) as e:
+                ultimo = str(e)
+
+        log.info("  el listado no termino de cargar (intento %d/%d)", intento + 1, intentos)
+
+    try:
+        page.screenshot(path=str(bot.SHOTS / "fichas_sin_listado.png"))
+    except (PWTimeout, PWError):
+        pass
+    raise PWTimeout("No cargo el listado de usuarios del panel. " + ultimo)
 
 
 # ---------------------------------------------------------------------------
@@ -394,7 +499,24 @@ def cargar_en_panel(page, usuario: str, monto: float) -> tuple[str, str]:
         return "error", f"No se abrio la pantalla de deposito (segui en {page.url})"
 
     id_panel = (RX_URL_DEPOSITO.search(page.url) or [None, "?"])[1]
-    log.info("  %s -> pantalla de deposito (id %s), cargando %g", usuario, id_panel, monto)
+    url_deposito = page.url
+
+    # El saldo del jugador figura en esta misma pantalla. Leerlo aca y no en el
+    # listado es lo que evita depender de que el listado vuelva a cargar
+    # despues del deposito, que es justo donde se trababa.
+    saldo_antes = saldo_en_deposito(page, usuario)
+    saldo_agente = saldo_agente_en_deposito(page)
+    log.info("  %s -> deposito (id %s), saldo %s, cargando %g (agente: %s)",
+             usuario, id_panel,
+             "?" if saldo_antes is None else f"{saldo_antes:g}", monto,
+             "?" if saldo_agente is None else f"{saldo_agente:g}")
+
+    # Sin plata en la cuenta del agente el panel rechaza el deposito, y desde
+    # afuera eso se ve igual que un fallo cualquiera: el saldo del jugador no se
+    # movio. Chequearlo antes convierte un misterio en un mensaje accionable.
+    if saldo_agente is not None and saldo_agente + 0.01 < monto:
+        return "error", (f"El agente tiene {saldo_agente:g} y la carga es de {monto:g}. "
+                         "Hay que recargar la cuenta del agente.")
 
     caja = primero(page, SEL_DEP_MONTO, 20_000)
     if caja is None:
@@ -423,9 +545,39 @@ def cargar_en_panel(page, usuario: str, monto: float) -> tuple[str, str]:
     # modal, esto devuelve "sin modal" y no toca nada.
     log.info("  %s", bot.confirmar_modal(page, 6_000, RX_MODAL_DEPOSITO))
 
-    # La confirmacion de verdad es el SALDO, no un cartel: volvemos al listado y
-    # comparamos. Un toast puede decir "ok" y no haber acreditado nada.
+    # La confirmacion de verdad es el SALDO, no un cartel: un toast puede decir
+    # "ok" sin haber acreditado nada.
+    #
+    # Se relee en la MISMA pantalla de deposito, cuya URL ya conocemos. Antes
+    # esto volvia al listado, y cuando el listado no cargaba (pasa seguido justo
+    # despues de depositar) la carga quedaba en 'revisar' aunque hubiera salido
+    # perfecta, y encima dejaba la pagina rota para la accion siguiente.
     page.wait_for_timeout(2_500)
+    saldo_despues = None
+    if saldo_antes is not None:
+        try:
+            page.goto(url_deposito, wait_until="domcontentloaded")
+            page.wait_for_timeout(1_200)
+            saldo_despues = saldo_en_deposito(page, usuario)
+        except (PWTimeout, PWError) as e:
+            log.info("  no pude releer la pantalla de deposito: %s", e)
+
+    # Los saldos leidos viajan por aca en vez de por el return: la funcion tiene
+    # una decena de salidas y agregarles dos valores a todas solo para esto
+    # ensuciaria mas de lo que aclara. Es seguro porque hay UN navegador y UN
+    # loop: nadie mas escribe esto entre que se setea y se lee.
+    ULTIMO_SALDO["antes"], ULTIMO_SALDO["despues"] = saldo_antes, saldo_despues
+
+    if saldo_antes is not None and saldo_despues is not None:
+        delta = saldo_despues - saldo_antes
+        if abs(delta - monto) < 0.01:
+            return "hecha", f"Saldo {saldo_antes:g} -> {saldo_despues:g}"
+        if abs(delta) < 0.01:
+            return "error", f"El saldo sigue en {saldo_antes:g}. El deposito no entro."
+        return "revisar", (f"Saldo {saldo_antes:g} -> {saldo_despues:g}, "
+                           f"esperaba +{monto:g} y dio +{delta:g}")
+
+    # Sin saldo legible en la pantalla de deposito, se cae al plan viejo.
     try:
         ir_a_usuarios(page)
         fila2 = buscar(page, usuario)
@@ -497,6 +649,7 @@ def procesar_pendientes(page, api: ApiAcciones | None = None, limite: int = 10) 
             continue
 
         log.info("Ejecutando %s", etiqueta)
+        ULTIMO_SALDO["antes"] = ULTIMO_SALDO["despues"] = None   # que no herede el anterior
         try:
             estado, detalle = cargar_en_panel(page, str(acc["usuario"]), float(acc["monto"]))
         except bot.SesionExpirada:
@@ -521,7 +674,8 @@ def procesar_pendientes(page, api: ApiAcciones | None = None, limite: int = 10) 
 
         nivel = log.info if estado == "hecha" else log.warning
         nivel("  %s -> %s", estado.upper(), detalle)
-        api.marcar(acc["id"], estado, detalle)
+        api.marcar(acc["id"], estado, detalle,
+                   ULTIMO_SALDO["antes"], ULTIMO_SALDO["despues"])
 
         time.sleep(1.5)                   # respirar entre operaciones
 
