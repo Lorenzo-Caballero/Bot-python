@@ -1,6 +1,12 @@
 services:
-  # Bot de alta de jugadores: sondea la cola de la API y llena el formulario
-  # "Crear jugador" del panel de agentes.
+  # Sondea las dos colas de la API con UN SOLO navegador:
+  #   - altas de jugadores  -> llena el formulario "Crear jugador"
+  #   - cargas de saldo     -> busca al jugador y le deposita (--con-fichas)
+  #
+  # Van juntas a proposito: son dos procesos distintos logueados con la misma
+  # cuenta de agente, y el panel puede invalidar una sesion al abrir la otra.
+  #
+  # Las cargas NO depositan hasta que pongas FICHAS_MODE=LIVE en el .env.
   creador:
     build: .
     image: ganamos-bot:latest
@@ -14,7 +20,7 @@ services:
     init: true
     volumes:
       - ./datos:/datos
-    command: ["python", "/app/bot_crear_jugador.py", "--headless"]
+    command: ["python", "/app/bot_crear_jugador.py", "--headless", "--con-fichas"]
     logging:
       driver: json-file
       options:

@@ -947,6 +947,8 @@ def main() -> int:
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="completa pero no envia")
     ap.add_argument("--lote", type=int, default=10, help="registros por pasada")
+    ap.add_argument("--con-fichas", action="store_true",
+                    help="en la misma pasada, ejecutar las cargas de saldo pendientes")
     ap.add_argument("--mantener-abierto", action="store_true",
                     help="al terminar deja la ventana abierta hasta que aprietes ENTER")
     args = ap.parse_args()
@@ -1039,6 +1041,25 @@ def main() -> int:
                         api.marcar(reg["id"], "ok" if ok else "error", msg)
 
                     time.sleep(random.uniform(2, 4))   # respirar entre cargas
+
+                # Cargas de saldo, en el MISMO navegador. Dos procesos con la
+                # misma cuenta de agente se pisan la sesion, asi que conviene
+                # que las dos tareas compartan este login.
+                if args.con_fichas:
+                    # Import adentro a proposito: bot_cargar_fichas nos importa
+                    # a nosotros, y arriba seria una dependencia circular.
+                    import bot_cargar_fichas as fichas
+                    try:
+                        fichas.procesar_pendientes(page)
+                    except SesionExpirada:
+                        log.warning("Sesion caida durante las fichas, re-logueando...")
+                        if not login_automatico(page):
+                            log.error("No pude re-loguear. Corto.")
+                            return 1
+                        guardar_sesion(ctx, page)
+                    except Exception:
+                        # Una carga que falla no puede tumbar el loop de altas.
+                        log.exception("Error procesando la cola de saldo")
 
                 if args.once:
                     break
