@@ -67,31 +67,50 @@ nuevo. Mirá los logs del primer arranque antes de darlo por hecho.
 
 ---
 
-## La cola (leer antes de dejarlo prendido)
+## La cola (hay que subirla a Hostinger antes de arrancar)
 
-`bot_crear_jugador.py` pide trabajo a `cola_panel.php`, que consulta la tabla
-`jugadores`. **La migración 07 borró esa tabla.** Hoy el endpoint responde:
+El bot no sale a buscar trabajo solo: lo pide por HTTP a la API propia. El
+endpoint viejo (`cola_panel.php`) consulta la tabla `jugadores`, que **la
+migración 07 borró**, así que hoy responde:
 
 ```
 SQLSTATE[42S02]: Base table or view not found: 1146
 Table 'u722310012_fauno888.jugadores' doesn't exist
 ```
 
-Con eso, el contenedor levanta, se loguea bien al panel y sondea cada 30s sin
-recibir nada nunca. Para que el bot vuelva a tener trabajo hace falta, del lado
-del server (Hostinger, por FTP — no va en este repo):
+El reemplazo ya está escrito y vive en el repo del proyecto, no en este:
 
-1. una migración `13` que cree la cola de altas en el esquema actual, y
-2. `cola_panel.php` apuntando a esa tabla nueva (el contrato con el bot —
-   `?accion=ver|pendientes|marcar|liberar` — no hace falta tocarlo).
+| Archivo | Dónde va |
+|---|---|
+| `api/sql/13_cola_altas.sql` | correr una vez en phpMyAdmin (crea la tabla `altas`) |
+| `api/altas_cola.php` | subir por FTP a `public_html/api/` |
 
-Mientras tanto, para verificar que todo lo demás funciona sin depender de la
-cola:
+El contrato HTTP es idéntico al viejo, así que **el bot no cambia**: solo apuntá
+`API_URL` a `.../api/altas_cola.php`.
+
+Sin eso, el contenedor levanta, se loguea bien al panel y sondea cada 30s sin
+recibir nada nunca.
+
+Para verificar sin abrir el navegador ni reclamar registros:
 
 ```bash
-docker compose run --rm creador python /app/bot_crear_jugador.py --probar-login
 docker compose run --rm creador python /app/bot_crear_jugador.py --probar-api
+docker compose run --rm creador python /app/bot_crear_jugador.py --probar-login
 ```
+
+Encolar un alta de prueba (la password va en claro porque el bot la **tipea**
+en el formulario del panel; se borra sola cuando el alta se confirma):
+
+```bash
+curl -X POST 'https://TU-DOMINIO/api/altas_cola.php?accion=encolar' \
+  -H 'X-API-Key: LA_MISMA_QUE_BOT_API_KEY' \
+  -H 'Content-Type: application/json' \
+  -H 'User-Agent: Mozilla/5.0' \
+  -d '{"usuario":"pruebabot01","password":"Prueba1234","origen":"crm"}'
+```
+
+El `User-Agent` de navegador no es opcional: el WAF de Hostinger corta los POST
+que no lo parecen.
 
 ---
 

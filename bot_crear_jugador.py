@@ -149,6 +149,17 @@ SEL_ABRIR_MODAL = (
     "button_colors_transparent"
 )
 
+# Despues de "CREAR JUGADOR" el panel abre un modal: "Esta seguro, que quiere
+# crear X?". Vive en su propio portal de React (#modal-root > div > div > div >
+# div), fuera del <form>. Hasta que no se confirma, el POST no sale.
+SEL_MODAL = "#modal-root"
+
+# CUIDADO al elegir el boton: en ese modal el vistoso (violeta, lleno) es
+# "Cancelar", y el que crea de verdad es el de contorno. Buscarlo por posicion,
+# por "el boton primario" o por el primer <button> del modal CANCELA el alta.
+# Va anclado (^...$) para no comerse el "CREAR JUGADOR" del formulario de atras.
+RX_CONFIRMAR = re.compile(r"^\s*crear\s+jugador\s*$", re.I)
+
 # Orden de tipeo. Importante: password ANTES de confirmPassword,
 # asi la validacion de "coinciden" corre con el valor final.
 ORDEN = [
@@ -453,12 +464,23 @@ def abrir_formulario(page) -> None:
     if es_pantalla_login(page):
         raise SesionExpirada(page.url)
 
-    # El click es best-effort: si el boton no esta (porque el form ya cargo, o
-    # porque el panel cambio el markup del subheader) no se corta nada, se deja
-    # que falle el wait_for_selector de abajo, que dice mucho mas.
-    if SEL_ABRIR_MODAL and page.locator(FORM).count() == 0:
+    # El panel es un SPA: recien salido de domcontentloaded el <form> todavia
+    # no existe, aunque la URL ya sea la del formulario. Preguntar aca por
+    # locator(FORM).count() da 0 SIEMPRE, y entonces el bot se aprieta el boton
+    # del subheader en cada alta y se va de la pagina. Primero se espera.
+    try:
+        page.wait_for_selector(FORM, timeout=10_000)
+        return
+    except PWTimeout:
+        pass
+
+    # No aparecio solo: recien ahi tiene sentido el boton "Crear usuario" del
+    # listado. Best-effort: si el markup del subheader cambio, se deja que
+    # falle el wait de abajo, que explica mucho mejor lo que paso.
+    if SEL_ABRIR_MODAL:
         boton = page.locator(SEL_ABRIR_MODAL)
         if boton.count() > 0:
+            log.info("  el form no cargo solo, voy por 'Crear usuario'")
             try:
                 boton.first.click(timeout=5_000)
             except (PWTimeout, PWError) as e:
@@ -502,6 +524,38 @@ def resultado_visual(page) -> tuple[bool | None, str]:
     return None, "sin señales en pantalla"
 
 
+def confirmar_modal(page, timeout_ms: int = 8_000) -> str:
+    """Aprieta "Crear Jugador" en el modal de confirmacion.
+
+    Se prueban tres formas en orden porque no sabemos con que esta hecho el
+    boton: <button>, algo con role=button, o un div cualquiera con ese texto.
+    Todas acotadas a #modal-root y filtradas por RX_CONFIRMAR, nunca por
+    posicion (ver el comentario de RX_CONFIRMAR: al lado esta "Cancelar").
+
+    No lanza: si no aparece el modal devuelve "sin modal", porque puede ser que
+    el POST haya salido con el primer click y eso no es un error.
+    """
+    limite = time.monotonic() + timeout_ms / 1000
+    modal = page.locator(SEL_MODAL)
+
+    while time.monotonic() < limite:
+        for como, loc in (
+            ("button", modal.locator("button").filter(has_text=RX_CONFIRMAR)),
+            ("rol",    modal.get_by_role("button", name=RX_CONFIRMAR)),
+            ("texto",  modal.get_by_text(RX_CONFIRMAR)),
+        ):
+            try:
+                if loc.count() == 0:
+                    continue
+                loc.first.click(timeout=3_000)
+                return f"modal confirmado por {como}"
+            except (PWTimeout, PWError):
+                continue        # todavia no esta pintado, o cambio abajo
+        page.wait_for_timeout(250)
+
+    return "sin modal"
+
+
 # ---------------------------------------------------------------------------
 # Carga de un jugador
 # ---------------------------------------------------------------------------
@@ -529,16 +583,24 @@ def crear_jugador(page, reg: dict, dry_run: bool = False) -> tuple[bool, str]:
         return True, "dry-run"
 
     # Interceptamos la respuesta del POST: es mas confiable que buscar un toast
+    detalle_modal = ""
     try:
-        with page.expect_response(es_respuesta_de_creacion, timeout=20_000) as info:
+        with page.expect_response(es_respuesta_de_creacion, timeout=30_000) as info:
             page.click(SEL["btn_crear"])
+            # El POST NO sale con ese click: primero hay que confirmar el modal.
+            # Esto va adentro del expect_response a proposito. Afuera, el bot
+            # se quedaria esperando una respuesta que todavia nadie disparo,
+            # hasta que venza el timeout.
+            detalle_modal = confirmar_modal(page)
+            log.info("  %s", detalle_modal)
         resp = info.value
     except PWTimeout:
         # Plan B: no reconocimos el POST, miramos la pantalla
         ok, detalle = resultado_visual(page)
         page.screenshot(path=str(SHOTS / f"sin_respuesta_{reg['id']}.png"))
+        detalle = f"{detalle} ({detalle_modal or 'no se llego al modal'})"
         if ok is None:
-            return False, "No se detecto la respuesta del servidor tras enviar"
+            return False, f"No se detecto la respuesta del servidor tras enviar. {detalle}"
         return ok, f"sin POST detectado, {detalle}"
 
     if resp.ok:
