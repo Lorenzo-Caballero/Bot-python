@@ -124,6 +124,31 @@ SEL_DEPOSITAR_EN_FILA = [
     "a.button.button_colors_default",
 ]
 
+# RETIRO. Ojo con la clase: el deposito es el boton LLENO
+# (button_colors_default) y el retiro el de CONTORNO
+# (button_colors_full-transparent). Estan uno al lado del otro en la misma fila:
+# confundirlos es hacer la operacion inversa a la que pidio el jugador.
+SEL_RETIRAR_EN_FILA = [
+    "div.adm-bets-table-row-user-mobile__buttons > "
+    "a.button.button_sizable_default.button_colors_full-transparent",
+    "div:nth-child(3) > div > a.button.button_colors_full-transparent",
+    "a.button.button_colors_full-transparent",
+]
+
+# La pantalla de retiro es la hermana de la de deposito. No se conoce su ruta,
+# asi que se aceptan las formas habituales y, si no, alcanza con que aparezca el
+# campo del monto (que se busca con los mismos selectores).
+RX_URL_RETIRO = re.compile(r"/user/(withdraw|retiro|retirar|payout|cashout)/(\d+)")
+
+SEL_RET_CONFIRMAR = [
+    'button:has-text("Retiro")',
+    'button:has-text("Retirar")',
+    '[class*="withdraw"][class*="buttons"] button.button_colors_default',
+    '[class*="retiro"][class*="buttons"] button.button_colors_default',
+]
+
+RX_MODAL_RETIRO = re.compile(r"^\s*(retiro|retirar|confirmar|aceptar|s[ií])\s*$", re.I)
+
 SEL_DEP_MONTO = [
     f"{_CONT} > div > div > div.deposit__top > div.deposit__inputs > "
     "div:nth-child(1) > div > div > div > div > input",
@@ -640,6 +665,93 @@ def cargar_en_panel(page, usuario: str, monto: float) -> tuple[str, str]:
                        f"Fila antes {antes} / despues {despues}")
 
 
+def retirar_en_panel(page, usuario: str, monto: float) -> tuple[str, str]:
+    """Retira `monto` de la cuenta de `usuario`. Espejo de cargar_en_panel().
+
+    La diferencia que importa: aca el saldo tiene que BAJAR. Y antes de tocar
+    nada se relee cuanto tiene REALMENTE en la plataforma, porque entre que el
+    jugador pidio el retiro por el chat y el bot llega a ejecutarlo pudo haber
+    jugado, o un agente pudo haberle sacado fichas a mano.
+    """
+    ir_a_usuarios(page)
+
+    fila = buscar(page, usuario)
+    if fila is None:
+        return "error", f"No encontre al usuario '{usuario}' en el panel"
+
+    boton = primero(page, SEL_RETIRAR_EN_FILA, 8_000, raiz=fila)
+    if boton is None:
+        page.screenshot(path=str(bot.SHOTS / f"retiro_sin_boton_{usuario}.png"))
+        return "error", f"Encontre a '{usuario}' pero no el boton de retiro en su fila"
+
+    url_antes = page.url
+    boton.click(timeout=10_000)
+
+    # No se conoce la ruta de esta pantalla: alcanza con que la URL cambie y
+    # aparezca el campo del monto.
+    try:
+        page.wait_for_function("u => location.href !== u", arg=url_antes, timeout=20_000)
+    except PWTimeout:
+        pass
+    url_retiro = page.url
+
+    caja = primero(page, SEL_DEP_MONTO, 20_000)
+    if caja is None:
+        page.screenshot(path=str(bot.SHOTS / f"retiro_sin_input_{usuario}.png"))
+        return "error", f"No se abrio la pantalla de retiro (segui en {page.url})"
+
+    saldo_antes = leer_con_reintento(page, lambda: saldo_en_deposito(page, usuario))
+    log.info("  %s -> retiro, saldo %s, retirando %g", usuario,
+             "?" if saldo_antes is None else f"{saldo_antes:g}", monto)
+
+    # LA verificacion de este flujo: no se retira mas de lo que hay. El chequeo
+    # del chatbot se hizo contra `usuarios.balance`, que puede estar viejo; este
+    # es contra el saldo de la plataforma, un segundo antes de ejecutar.
+    if saldo_antes is not None and saldo_antes + 0.01 < monto:
+        return "error", (f"El jugador tiene {saldo_antes:g} y pidio retirar {monto:g}. "
+                         "No alcanza.")
+
+    problema = poner_monto(page, caja, monto)
+    if problema:
+        page.screenshot(path=str(bot.SHOTS / f"retiro_monto_{usuario}.png"))
+        return "error", problema
+
+    if MODO != "LIVE":
+        page.screenshot(path=str(bot.SHOTS / f"dryrun_retiro_{usuario}.png"))
+        return "dry-run", f"[DRY_RUN] retiro de {monto:g} para {usuario} listo, NO se envio"
+
+    confirmar = primero(page, SEL_RET_CONFIRMAR, 10_000)
+    if confirmar is None:
+        page.screenshot(path=str(bot.SHOTS / f"retiro_sin_confirmar_{usuario}.png"))
+        return "error", "No encontre el boton de confirmar el retiro"
+
+    confirmar.click(timeout=10_000)
+    log.info("  %s", bot.confirmar_modal(page, 6_000, RX_MODAL_RETIRO))
+
+    page.wait_for_timeout(2_500)
+    saldo_despues = None
+    if saldo_antes is not None:
+        try:
+            page.goto(url_retiro, wait_until="domcontentloaded")
+            page.wait_for_timeout(1_200)
+            saldo_despues = leer_con_reintento(page, lambda: saldo_en_deposito(page, usuario))
+        except (PWTimeout, PWError) as e:
+            log.info("  no pude releer la pantalla de retiro: %s", e)
+
+    ULTIMO_SALDO["antes"], ULTIMO_SALDO["despues"] = saldo_antes, saldo_despues
+
+    if saldo_antes is not None and saldo_despues is not None:
+        bajo = saldo_antes - saldo_despues
+        if abs(bajo - monto) < 0.01:
+            return "hecha", f"Saldo {saldo_antes:g} -> {saldo_despues:g}"
+        if abs(bajo) < 0.01:
+            return "error", f"El saldo sigue en {saldo_antes:g}. El retiro no se hizo."
+        return "revisar", (f"Saldo {saldo_antes:g} -> {saldo_despues:g}, "
+                           f"esperaba -{monto:g} y bajo {bajo:g}")
+
+    return "revisar", "Retiro enviado pero no pude confirmar el saldo"
+
+
 # ---------------------------------------------------------------------------
 # Una pasada
 # ---------------------------------------------------------------------------
@@ -665,15 +777,11 @@ def procesar_pendientes(page, api: ApiAcciones | None = None, limite: int = 10) 
     for acc in lote:
         etiqueta = f"{acc.get('id')} / {acc.get('usuario')} / {acc.get('tipo')} {acc.get('monto')}"
 
-        if acc.get("tipo") != "cargar":
-            log.warning("  %s -> el retiro todavia no esta automatizado", etiqueta)
-            api.marcar(acc["id"], "revisar", "Retiro: hacerlo a mano en el panel")
-            continue
-
         log.info("Ejecutando %s", etiqueta)
         ULTIMO_SALDO["antes"] = ULTIMO_SALDO["despues"] = None   # que no herede el anterior
+        hacer = retirar_en_panel if acc.get("tipo") == "retirar" else cargar_en_panel
         try:
-            estado, detalle = cargar_en_panel(page, str(acc["usuario"]), float(acc["monto"]))
+            estado, detalle = hacer(page, str(acc["usuario"]), float(acc["monto"]))
         except bot.SesionExpirada:
             # La sesion se cayo: NO se marca nada. La accion queda 'procesando'
             # y a los 15 min el server la manda a 'revisar'. Marcarla como error
