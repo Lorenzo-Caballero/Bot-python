@@ -50,26 +50,69 @@ log = logging.getLogger("fichas")
 URL_USUARIOS = "https://agents.ganamosonline.com/users/all"
 
 # ---------------------------------------------------------------------------
-# Selectores del panel (verificados contra la pantalla real)
+# Selectores del panel
+#
+# Cada rol es una LISTA y se prueba en orden, porque el panel sirve dos layouts
+# distintos (escritorio y mobile) con clases que no se parecen en nada, y no
+# controlamos cual le toca al navegador del contenedor. Ultimo de cada lista:
+# una version corta que sobrevive a los reacomodos del markup.
 # ---------------------------------------------------------------------------
-_CONT = ("#root > div > div.app__wrapper > main > div.app__wrapper__content")
+_CONT = "#root > div > div.app__wrapper > main > div.app__wrapper__content"
 
-SEL_BUSCAR = (f"{_CONT} > div.users > div.users__filter > form > "
-              "div:nth-child(1) > div.search-user-input > div > input")
+SEL_BUSCAR = [
+    f"{_CONT} > div.users > div.users__filter > form > div:nth-child(1) > "
+    "div.search-user-input > div > input",
+    f"{_CONT} > div > div.users-mobile__search > div > div:nth-child(1) > "
+    "div.search-user-input > div > input",
+    ".search-user-input input",
+]
 
-# La tabla no es <table>: son divs. La fila 1 es la unica que se toca.
-_FILA1 = (f"{_CONT} > div.users > div.users-table.users-table_tab_all > "
-          "div.users-table__table > div.users-table__tbody > div:nth-child(1)")
+# Desplegable de coincidencias. En varias pantallas la tabla NO filtra sola:
+# recien se acomoda cuando se elige una opcion de aca.
+SEL_SUGERENCIA = [
+    ".search-user-input__search-results > div",
+]
 
-SEL_FILA_USUARIO   = f"{_FILA1} > div:nth-child(1)"
-SEL_FILA_SALDO     = f"{_FILA1} > div:nth-child(2)"
-SEL_FILA_DEPOSITAR = (f"{_FILA1} > div:nth-child(3) > div > "
-                      "a.button.button_sizable_default.button_colors_default")
+# La tabla no es <table>, son divs. Solo se mira la PRIMERA fila.
+SEL_FILA = [
+    f"{_CONT} > div.users > div.users-table.users-table_tab_all > "
+    "div.users-table__table > div.users-table__tbody > div:nth-child(1)",
+    f"{_CONT} > div > div.users-table-mobile.users-table-mobile_tab_all > "
+    "div.users-table-mobile__table > div.users-table-mobile__rows > div",
+    ".users-table__tbody > div",
+    ".users-table-mobile__rows > div",
+]
 
-SEL_DEP_MONTO = (f"{_CONT} > div > div > div.deposit__top > div.deposit__inputs > "
-                 "div:nth-child(1) > div > div > div > div > input")
-SEL_DEP_CONFIRMAR = (f"{_CONT} > div > div > div.deposit__bottom > "
-                     "button.button.button_sizable_low.button_colors_default")
+# Relativos a la fila.
+SEL_NOMBRE_EN_FILA = [
+    "div.adm-bets-table-row-user-mobile__user-block-user > span",
+    '[class*="user-block-user"] > span',
+    "div:nth-child(1)",
+]
+
+SEL_DEPOSITAR_EN_FILA = [
+    "div:nth-child(3) > div > a.button.button_colors_default",
+    "div.adm-bets-table-row-user-mobile__buttons > a.button.button_colors_default",
+    "a.button.button_colors_default",
+]
+
+SEL_DEP_MONTO = [
+    f"{_CONT} > div > div > div.deposit__top > div.deposit__inputs > "
+    "div:nth-child(1) > div > div > div > div > input",
+    f"{_CONT} > div > div.deposit-mobile__inputs > div:nth-child(1) > "
+    "div > div > div > input",
+    '[class*="deposit"][class*="inputs"] input',
+]
+
+SEL_DEP_CONFIRMAR = [
+    f"{_CONT} > div > div > div.deposit__bottom > button.button.button_colors_default",
+    f"{_CONT} > div > div.deposit-mobile__buttons > button.button.button_colors_default",
+    '[class*="deposit"][class*="buttons"] button.button_colors_default',
+]
+
+# Al elegir depositar, el panel navega a /user/deposit/<id-del-jugador>.
+# Es la confirmacion de que se abrio la pantalla del jugador correcto.
+RX_URL_DEPOSITO = re.compile(r"/user/deposit/(\d+)")
 
 MODO = os.environ.get("FICHAS_MODE", "DRY_RUN").upper()
 POLL = int(os.environ.get("FICHAS_POLL_SEGUNDOS", 20))
@@ -126,49 +169,103 @@ class ApiAcciones:
 # ---------------------------------------------------------------------------
 # Lectura de la tabla
 # ---------------------------------------------------------------------------
-def parse_monto(txt: str) -> float:
-    """'1.440,40' -> 1440.4   El panel usa formato es-AR (punto=miles)."""
-    limpio = re.sub(r"[^\d,.\-]", "", txt or "")
-    limpio = limpio.replace(".", "").replace(",", ".")
+def primero(page, selectores: list[str], timeout_ms: int = 8_000, raiz=None):
+    """El primer selector de la lista que exista y se vea. None si ninguno.
+
+    Es lo que permite bancar los dos layouts del panel sin saber de antemano
+    cual nos toco: se prueban todos hasta que uno aparece.
+    """
+    limite = time.monotonic() + timeout_ms / 1000
+    while True:
+        for s in selectores:
+            try:
+                loc = (raiz or page).locator(s)
+                if loc.count() > 0 and loc.first.is_visible():
+                    return loc.first
+            except (PWTimeout, PWError):
+                pass
+        if time.monotonic() >= limite:
+            return None
+        page.wait_for_timeout(200)
+
+
+def montos_de(texto: str) -> list[float]:
+    """Todos los numeros con pinta de plata que haya en un texto.
+
+    Se sacan TODOS en vez de leer una celda puntual porque en el layout mobile
+    el saldo no tiene un selector propio: viene mezclado en la fila. Despues se
+    compara la lista de antes contra la de despues.
+    """
+    montos = []
+    for crudo in re.findall(r"-?\d[\d.,]*", texto or ""):
+        limpio = crudo.replace(".", "").replace(",", ".")
+        try:
+            montos.append(float(limpio))
+        except ValueError:
+            pass
+    return montos
+
+
+def nombre_de_fila(page, fila) -> str:
+    """El nombre de usuario de una fila, sin la etiqueta PLAYER ni el saldo."""
+    for sel in SEL_NOMBRE_EN_FILA:
+        try:
+            n = fila.locator(sel)
+            if n.count() == 0:
+                continue
+            for linea in (n.first.inner_text(timeout=3_000) or "").splitlines():
+                if linea.strip():
+                    return linea.strip()
+        except (PWTimeout, PWError):
+            continue
+    # Ultimo recurso: la primera linea de la fila entera.
     try:
-        return float(limpio)
-    except ValueError:
-        return 0.0
-
-
-def texto_usuario(page) -> str:
-    """La celda trae el usuario y abajo la etiqueta PLAYER. Solo la 1ra linea."""
-    crudo = page.locator(SEL_FILA_USUARIO).inner_text(timeout=5_000)
-    for linea in (crudo or "").splitlines():
-        if linea.strip():
-            return linea.strip()
+        for linea in (fila.inner_text(timeout=3_000) or "").splitlines():
+            if linea.strip():
+                return linea.strip()
+    except (PWTimeout, PWError):
+        pass
     return ""
 
 
-def buscar(page, usuario: str, timeout_s: float = 12.0) -> float | None:
-    """Filtra por `usuario` y espera a que la fila 1 sea EXACTAMENTE ese.
+def buscar(page, usuario: str, timeout_s: float = 15.0):
+    """Filtra por `usuario` y devuelve la fila SOLO si es EXACTAMENTE ese.
 
-    Devuelve el saldo de la fila, o None si nunca aparecio.
-
-    El match exacto es lo que evita el peor error posible: buscar 'fauno2' trae
-    tambien 'fauno232' y 'fauno2999', y la fila 1 puede ser cualquiera de los
+    El match exacto evita el peor error posible: buscar 'fauno2' trae tambien
+    'fauno232' y 'fauno2999', y la primera fila puede ser cualquiera de los
     tres. Depositar en el que no es no se deshace.
     """
-    caja = page.locator(SEL_BUSCAR)
+    caja = primero(page, SEL_BUSCAR, 15_000)
+    if caja is None:
+        log.warning("  no encontre el buscador de usuarios en el panel")
+        return None
+
     caja.click(timeout=10_000)
     caja.fill("")
-    # El panel avisa "introducir texto solo en minusculas" al lado del campo.
-    caja.type(usuario.lower(), delay=40)
+    # El panel aclara "introducir texto solo en minusculas" al lado del campo.
+    caja.type(usuario.lower(), delay=50)
+
+    # El desplegable de coincidencias: en varias pantallas la tabla NO filtra
+    # hasta que se elige una opcion. Si no lo clickeamos, la primera fila sigue
+    # siendo la de otro jugador y esto termina en "no lo encontre".
+    sug = primero(page, SEL_SUGERENCIA, 6_000)
+    if sug is not None:
+        try:
+            sug.click(timeout=4_000)
+        except (PWTimeout, PWError) as e:
+            log.info("  la sugerencia no se dejo clickear (%s), sigo igual", e)
 
     limite = time.monotonic() + timeout_s
+    visto = ""
     while time.monotonic() < limite:
-        try:
-            if texto_usuario(page).lower() == usuario.lower():
-                return parse_monto(page.locator(SEL_FILA_SALDO).inner_text(timeout=5_000))
-        except (PWTimeout, PWError):
-            pass                      # la tabla se esta redibujando
+        fila = primero(page, SEL_FILA, 1_000)
+        if fila is not None:
+            visto = nombre_de_fila(page, fila)
+            if visto.lower() == usuario.lower():
+                return fila
         page.wait_for_timeout(300)
 
+    log.warning("  la primera fila quedo en '%s', no en '%s'", visto or "(vacia)", usuario)
     return None
 
 
@@ -179,7 +276,8 @@ def ir_a_usuarios(page) -> None:
         page.reload(wait_until="domcontentloaded")
     if bot.es_pantalla_login(page):
         raise bot.SesionExpirada(page.url)
-    page.wait_for_selector(SEL_BUSCAR, timeout=20_000)
+    if primero(page, SEL_BUSCAR, 20_000) is None:
+        raise PWTimeout("No cargo el listado de usuarios del panel")
 
 
 # ---------------------------------------------------------------------------
@@ -196,51 +294,95 @@ def cargar_en_panel(page, usuario: str, monto: float) -> tuple[str, str]:
     """
     ir_a_usuarios(page)
 
-    saldo_antes = buscar(page, usuario)
-    if saldo_antes is None:
+    fila = buscar(page, usuario)
+    if fila is None:
         return "error", f"No encontre al usuario '{usuario}' en el panel"
 
-    log.info("  %s: saldo actual %.2f, cargando %.2f", usuario, saldo_antes, monto)
+    try:
+        antes = montos_de(fila.inner_text(timeout=5_000))
+    except (PWTimeout, PWError):
+        antes = []
 
-    page.click(SEL_FILA_DEPOSITAR, timeout=10_000)
-    page.wait_for_selector(SEL_DEP_MONTO, timeout=20_000)
+    boton = primero(page, SEL_DEPOSITAR_EN_FILA, 8_000, raiz=fila)
+    if boton is None:
+        page.screenshot(path=str(bot.SHOTS / f"fichas_sin_boton_{usuario}.png"))
+        return "error", f"Encontre a '{usuario}' pero no el boton de depositar en su fila"
 
-    caja = page.locator(SEL_DEP_MONTO)
+    boton.click(timeout=10_000)
+
+    # El panel navega a /user/deposit/<id>. Que llegue ahi confirma que se
+    # abrio la pantalla de UN jugador; el cual, lo garantiza el match exacto.
+    try:
+        page.wait_for_url(RX_URL_DEPOSITO, timeout=20_000)
+    except PWTimeout:
+        page.screenshot(path=str(bot.SHOTS / f"fichas_sin_deposito_{usuario}.png"))
+        return "error", f"No se abrio la pantalla de deposito (segui en {page.url})"
+
+    id_panel = (RX_URL_DEPOSITO.search(page.url) or [None, "?"])[1]
+    log.info("  %s -> pantalla de deposito (id %s), cargando %s", usuario, id_panel, monto)
+
+    caja = primero(page, SEL_DEP_MONTO, 20_000)
+    if caja is None:
+        page.screenshot(path=str(bot.SHOTS / f"fichas_sin_input_{usuario}.png"))
+        return "error", "No encontre el campo del monto en la pantalla de deposito"
+
     caja.click()
     caja.fill("")
     # Entero si es entero: algunos campos rechazan el punto decimal.
-    caja.type(str(int(monto)) if float(monto).is_integer() else str(monto), delay=40)
+    caja.type(str(int(monto)) if float(monto).is_integer() else str(monto), delay=50)
 
     if MODO != "LIVE":
         page.screenshot(path=str(bot.SHOTS / f"dryrun_fichas_{usuario}.png"))
-        return "dry-run", f"[DRY_RUN] formulario listo con {monto}, NO se envio"
+        return "dry-run", f"[DRY_RUN] formulario listo con {monto} para {usuario}, NO se envio"
 
-    page.click(SEL_DEP_CONFIRMAR, timeout=10_000)
+    confirmar = primero(page, SEL_DEP_CONFIRMAR, 10_000)
+    if confirmar is None:
+        page.screenshot(path=str(bot.SHOTS / f"fichas_sin_confirmar_{usuario}.png"))
+        return "error", "No encontre el boton de depositar"
 
-    # La confirmacion de verdad es el SALDO, no un cartel: volvemos a buscar al
-    # usuario y comparamos. Un toast puede decir "ok" y no haber acreditado.
+    confirmar.click(timeout=10_000)
+
+    # La confirmacion de verdad es el SALDO, no un cartel: volvemos al listado y
+    # comparamos. Un toast puede decir "ok" y no haber acreditado nada.
     page.wait_for_timeout(2_500)
     try:
         ir_a_usuarios(page)
-        saldo_despues = buscar(page, usuario)
+        fila2 = buscar(page, usuario)
     except (PWTimeout, PWError) as e:
         return "revisar", f"Deposito enviado pero no pude releer el saldo: {e}"
 
-    if saldo_despues is None:
+    if fila2 is None:
         return "revisar", "Deposito enviado pero el usuario no volvio a aparecer en la lista"
 
-    delta = saldo_despues - saldo_antes
+    try:
+        despues = montos_de(fila2.inner_text(timeout=5_000))
+    except (PWTimeout, PWError):
+        return "revisar", "Deposito enviado pero no pude leer la fila despues"
 
-    if abs(delta - monto) < 0.01:
-        return "hecha", f"Saldo {saldo_antes:.2f} -> {saldo_despues:.2f}"
+    # Se compara la fila entera, y no una celda fija, porque en mobile el saldo
+    # no tiene selector propio y viene mezclado con el resto.
+    #
+    # Primero por POSICION: si la fila tiene los mismos campos que antes, el que
+    # subio el monto es el saldo, y no hay lugar a dudas. La comparacion suelta
+    # (cualquiera con cualquiera) queda de respaldo, pero puede dar un falso
+    # positivo: en la fila tambien hay numeros del nombre y de la fecha.
+    if len(antes) == len(despues):
+        for i, a in enumerate(antes):
+            if abs((despues[i] - a) - monto) < 0.01:
+                return "hecha", f"Saldo {a:.2f} -> {despues[i]:.2f}"
 
-    if abs(delta) < 0.01:
-        return "error", f"El saldo no se movio ({saldo_antes:.2f}). El deposito no entro."
+    for a in antes:
+        for d in despues:
+            if abs((d - a) - monto) < 0.01:
+                return "hecha", f"Saldo {a:.2f} -> {d:.2f} (por coincidencia de monto)"
 
-    # Ni lo esperado ni cero: puede ser que el jugador haya apostado en el medio.
+    if antes and antes == despues:
+        return "error", "Ningun numero de la fila se movio. El deposito no entro."
+
+    # Ni lo esperado ni "no paso nada": puede haber apostado en el medio.
     # No se toca la plata: lo mira una persona.
-    return "revisar", (f"Saldo {saldo_antes:.2f} -> {saldo_despues:.2f} "
-                       f"(esperaba +{monto:.2f}, dio +{delta:.2f})")
+    return "revisar", (f"No pude confirmar el deposito de {monto}. "
+                       f"Fila antes {antes} / despues {despues}")
 
 
 # ---------------------------------------------------------------------------
