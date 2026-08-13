@@ -1,0 +1,19 @@
+# Nada de esto tiene por que entrar a la imagen, y el .env menos que nada:
+# lo que se copia queda grabado en un layer aunque despues lo borres.
+.env
+.env.*
+!.env.example
+datos/
+datos-sync/
+capturas/
+estado_sesion.json
+estado_session_storage.json
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/
+.git/
+.gitignore
+README.md
+docker-compose.yml

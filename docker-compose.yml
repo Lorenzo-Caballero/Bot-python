@@ -1,0 +1,48 @@
+services:
+  # Bot de alta de jugadores: sondea la cola de la API y llena el formulario
+  # "Crear jugador" del panel de agentes.
+  creador:
+    build: .
+    image: ganamos-bot:latest
+    container_name: ganamos-bot-creador
+    restart: unless-stopped
+    env_file: .env
+    # Chromium se cuelga con los 64MB de /dev/shm que Docker da por defecto.
+    shm_size: "1gb"
+    # PID 1 seria python, que no cosecha los hijos que deja Chromium: sin init
+    # el contenedor se llena de zombies despues de unos dias de loop.
+    init: true
+    volumes:
+      - ./datos:/datos
+    command: ["python", "/app/bot_crear_jugador.py", "--headless"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Espejo de usuarios del panel -> tabla `usuarios`. Apagado por defecto:
+  # levantalo con  docker compose --profile sync up -d
+  #
+  # OJO: usa su propio volumen porque dos contenedores no pueden compartir el
+  # mismo estado_sesion.json (se pisan al guardarlo). Eso significa DOS logins
+  # con la misma cuenta de agente: si el panel invalida la sesion vieja al
+  # entrar de nuevo, van a estar pateandose el login entre los dos. Probalo
+  # antes de dejar los dos prendidos.
+  sync:
+    build: .
+    image: ganamos-bot:latest
+    container_name: ganamos-bot-sync
+    restart: unless-stopped
+    env_file: .env
+    shm_size: "1gb"
+    init: true
+    volumes:
+      - ./datos-sync:/datos
+    command: ["python", "/app/sync_usuarios.py", "--headless", "--loop", "300"]
+    profiles: ["sync"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

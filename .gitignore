@@ -1,0 +1,15 @@
+# Secretos y sesion del panel: NUNCA al repo.
+.env
+estado_sesion.json
+estado_session_storage.json
+
+# Todo lo que escribe el contenedor (volumenes).
+datos/
+datos-sync/
+
+capturas/
+*.log
+__pycache__/
+*.pyc
+.venv/
+venv/

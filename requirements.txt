@@ -1,0 +1,6 @@
+# Pineado a las versiones con las que el bot anda hoy en local. Sin pin, un
+# rebuild dentro de seis meses se trae otro Chromium y otro Playwright, y si
+# algo se rompe no vas a saber si fue el panel o la libreria.
+playwright==1.62.0
+requests==2.34.2
+python-dotenv==1.2.2
