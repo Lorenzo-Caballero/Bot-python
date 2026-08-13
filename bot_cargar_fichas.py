@@ -178,8 +178,7 @@ class ApiAcciones:
         self.key = os.environ.get("API_KEY", "")
         if not self.url or not self.key:
             raise bot.ErrorConfig("Faltan API_URL/ACCIONES_URL o API_KEY en el .env")
-        self.s = requests.Session()
-        self.s.headers.update({"X-API-Key": self.key, "Accept": "application/json"})
+        self.s = bot.sesion_http(self.key)
 
     def pendientes(self, limite: int = 10) -> list[dict]:
         """OJO: esto RECLAMA las acciones (las pasa a 'procesando')."""
@@ -289,6 +288,25 @@ def poner_monto(page, caja, monto: float) -> str:
             log.info("  fallo %s() en el campo del monto: %s", metodo, e)
 
     return f"el campo del monto quedo en '{leido}', no en '{texto}'"
+
+
+def leer_con_reintento(page, leer, intentos: int = 4, espera_ms: int = 700):
+    """Reintenta una lectura hasta que devuelva algo.
+
+    Los numeros de la pantalla de deposito llegan por una request aparte y
+    aparecen despues del resto del formulario. Un solo intento los agarra a
+    medio pintar y devuelve None.
+    """
+    for i in range(intentos):
+        try:
+            v = leer()
+            if v is not None:
+                return v
+        except (PWTimeout, PWError):
+            pass
+        if i < intentos - 1:
+            page.wait_for_timeout(espera_ms)
+    return None
 
 
 def saldo_agente_en_deposito(page):
@@ -504,8 +522,17 @@ def cargar_en_panel(page, usuario: str, monto: float) -> tuple[str, str]:
     # El saldo del jugador figura en esta misma pantalla. Leerlo aca y no en el
     # listado es lo que evita depender de que el listado vuelva a cargar
     # despues del deposito, que es justo donde se trababa.
-    saldo_antes = saldo_en_deposito(page, usuario)
-    saldo_agente = saldo_agente_en_deposito(page)
+    # El campo del monto PRIMERO, aunque todavia no se use: es la señal de que
+    # la pantalla termino de pintarse. wait_for_url se cumple apenas cambia la
+    # URL -la navegacion del SPA es instantanea- y si se leen los saldos ahi,
+    # se leen de una pantalla vacia y salen todos en "?".
+    caja = primero(page, SEL_DEP_MONTO, 20_000)
+    if caja is None:
+        page.screenshot(path=str(bot.SHOTS / f"fichas_sin_input_{usuario}.png"))
+        return "error", "No encontre el campo del monto en la pantalla de deposito"
+
+    saldo_antes = leer_con_reintento(page, lambda: saldo_en_deposito(page, usuario))
+    saldo_agente = leer_con_reintento(page, lambda: saldo_agente_en_deposito(page))
     log.info("  %s -> deposito (id %s), saldo %s, cargando %g (agente: %s)",
              usuario, id_panel,
              "?" if saldo_antes is None else f"{saldo_antes:g}", monto,
@@ -517,11 +544,6 @@ def cargar_en_panel(page, usuario: str, monto: float) -> tuple[str, str]:
     if saldo_agente is not None and saldo_agente + 0.01 < monto:
         return "error", (f"El agente tiene {saldo_agente:g} y la carga es de {monto:g}. "
                          "Hay que recargar la cuenta del agente.")
-
-    caja = primero(page, SEL_DEP_MONTO, 20_000)
-    if caja is None:
-        page.screenshot(path=str(bot.SHOTS / f"fichas_sin_input_{usuario}.png"))
-        return "error", "No encontre el campo del monto en la pantalla de deposito"
 
     problema = poner_monto(page, caja, monto)
     if problema:

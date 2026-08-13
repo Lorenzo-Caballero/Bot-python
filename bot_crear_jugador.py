@@ -65,6 +65,8 @@ import time
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from dotenv import load_dotenv
 from playwright.sync_api import Error as PWError
 from playwright.sync_api import TimeoutError as PWTimeout
@@ -254,6 +256,33 @@ class ErrorConfig(Exception):
     """El .env no esta completo. No tiene sentido reintentar."""
 
 
+def sesion_http(key: str) -> requests.Session:
+    """Session con reintentos, para las dos colas.
+
+    Hostinger cierra las conexiones keep-alive ociosas. Como el bot sondea cada
+    30s y reusa el socket, cada tanto le toca uno ya cerrado del otro lado y
+    salta 'RemoteDisconnected: Remote end closed connection without response'.
+    No es que la API este caida: es un socket muerto, y con reintentarlo alcanza.
+
+    Se reintentan tambien los POST, al reves del default de urllib3. Los dos que
+    hay -marcar de altas y marcar de saldo- solo cierran una accion que este
+    abierta, asi que repetirlos no hace nada la segunda vez.
+    """
+    s = requests.Session()
+    s.headers.update({"X-API-Key": key, "Accept": "application/json"})
+    reintentos = Retry(
+        total=3,
+        backoff_factor=0.6,             # 0.6s, 1.2s, 2.4s
+        status_forcelist=(502, 503, 504),
+        allowed_methods=frozenset(["GET", "POST"]),
+        raise_on_status=False,
+    )
+    adaptador = HTTPAdapter(max_retries=reintentos)
+    s.mount("https://", adaptador)
+    s.mount("http://", adaptador)
+    return s
+
+
 class ApiJugadores:
     def __init__(self):
         self.url = os.environ.get("API_URL", "")
@@ -271,8 +300,7 @@ class ApiJugadores:
                     "BOT_API_KEY del server en API_KEY."
                 )
 
-        self.s = requests.Session()
-        self.s.headers.update({"X-API-Key": self.key, "Accept": "application/json"})
+        self.s = sesion_http(self.key)
 
     def pendientes(self, limite: int = 10) -> list[dict]:
         """OJO: esto RECLAMA los registros (los pasa a 'procesando').
