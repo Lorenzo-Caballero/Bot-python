@@ -524,8 +524,12 @@ def resultado_visual(page) -> tuple[bool | None, str]:
     return None, "sin señales en pantalla"
 
 
-def confirmar_modal(page, timeout_ms: int = 8_000) -> str:
-    """Aprieta "Crear Jugador" en el modal de confirmacion.
+def confirmar_modal(page, timeout_ms: int = 8_000, rx: re.Pattern = None) -> str:
+    """Aprieta el boton de confirmar del modal (por defecto, "Crear Jugador").
+
+    `rx` es el texto EXACTO del boton que confirma. Lo usa tambien el bot de
+    fichas, con su propio texto: los dos modales del panel tienen al lado un
+    "Cancelar", asi que nunca se elige por posicion.
 
     Se prueban tres formas en orden porque no sabemos con que esta hecho el
     boton: <button>, algo con role=button, o un div cualquiera con ese texto.
@@ -535,14 +539,15 @@ def confirmar_modal(page, timeout_ms: int = 8_000) -> str:
     No lanza: si no aparece el modal devuelve "sin modal", porque puede ser que
     el POST haya salido con el primer click y eso no es un error.
     """
+    rx = rx or RX_CONFIRMAR
     limite = time.monotonic() + timeout_ms / 1000
     modal = page.locator(SEL_MODAL)
 
     while time.monotonic() < limite:
         for como, loc in (
-            ("button", modal.locator("button").filter(has_text=RX_CONFIRMAR)),
-            ("rol",    modal.get_by_role("button", name=RX_CONFIRMAR)),
-            ("texto",  modal.get_by_text(RX_CONFIRMAR)),
+            ("button", modal.locator("button").filter(has_text=rx)),
+            ("rol",    modal.get_by_role("button", name=rx)),
+            ("texto",  modal.get_by_text(rx)),
         ):
             try:
                 if loc.count() == 0:

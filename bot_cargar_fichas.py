@@ -117,11 +117,18 @@ SEL_DEP_MONTO = [
     '[class*="deposit"][class*="inputs"] input',
 ]
 
+# El boton que deposita dice "DEPÓSITO" y es el lleno; al lado esta "CANCELAR".
+# Por eso primero se busca por TEXTO y recien despues por clase.
 SEL_DEP_CONFIRMAR = [
+    'button:has-text("Depósito")',
+    'button:has-text("Deposito")',
     f"{_CONT} > div > div > div.deposit__bottom > button.button.button_colors_default",
     f"{_CONT} > div > div.deposit-mobile__buttons > button.button.button_colors_default",
     '[class*="deposit"][class*="buttons"] button.button_colors_default',
 ]
+
+# Si el panel pide confirmar en un modal, como hace con el alta de jugadores.
+RX_MODAL_DEPOSITO = re.compile(r"^\s*(dep[oó]sito|depositar|confirmar|aceptar|s[ií])\s*$", re.I)
 
 # Al elegir depositar, el panel navega a /user/deposit/<id-del-jugador>.
 # Es la confirmacion de que se abrio la pantalla del jugador correcto.
@@ -387,7 +394,7 @@ def cargar_en_panel(page, usuario: str, monto: float) -> tuple[str, str]:
         return "error", f"No se abrio la pantalla de deposito (segui en {page.url})"
 
     id_panel = (RX_URL_DEPOSITO.search(page.url) or [None, "?"])[1]
-    log.info("  %s -> pantalla de deposito (id %s), cargando %s", usuario, id_panel, monto)
+    log.info("  %s -> pantalla de deposito (id %s), cargando %g", usuario, id_panel, monto)
 
     caja = primero(page, SEL_DEP_MONTO, 20_000)
     if caja is None:
@@ -410,6 +417,11 @@ def cargar_en_panel(page, usuario: str, monto: float) -> tuple[str, str]:
         return "error", "No encontre el boton de depositar"
 
     confirmar.click(timeout=10_000)
+
+    # El panel pide confirmar en un modal cuando se crea un jugador; si tambien
+    # lo hace aca y nadie lo aprieta, el deposito no entra nunca. Si no hay
+    # modal, esto devuelve "sin modal" y no toca nada.
+    log.info("  %s", bot.confirmar_modal(page, 6_000, RX_MODAL_DEPOSITO))
 
     # La confirmacion de verdad es el SALDO, no un cartel: volvemos al listado y
     # comparamos. Un toast puede decir "ok" y no haber acreditado nada.
