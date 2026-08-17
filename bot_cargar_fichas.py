@@ -111,6 +111,27 @@ SEL_FILA = [
     ".users-table-mobile__rows > div",
 ]
 
+# Mientras busca, el panel tapa la tabla con un overlay que dice "We are
+# looking for..". La tabla que se ve DEBAJO es todavia la de la busqueda
+# anterior, casi siempre "NO SE ENCONTRARON RESULTADOS".
+#
+# Leerla en ese momento hacia que CUALQUIER usuario diera "no encontrado", aun
+# estando logueado y aun existiendo el jugador. No era cuestion de subir el
+# timeout: por rapido o lento que sea, hay que esperar a que el overlay se vaya
+# antes de creerle a la tabla.
+SEL_CARGANDO = [
+    "text=/we are looking for/i",
+    "text=/estamos buscando/i",
+    '[class*="preloader"]',
+    '[class*="spinner"]',
+    '[class*="loader"]',
+]
+
+# Lo que pone la tabla cuando no hay resultados. Con el overlay puesto no
+# significa nada; recien vale cuando la busqueda termino.
+TXT_SIN_RESULTADOS = ("no se encontraron resultados", "no results found",
+                      "no results", "sin resultados", "0 registros")
+
 # Relativos a la fila.
 SEL_NOMBRE_EN_FILA = [
     "div.adm-bets-table-row-user-mobile__user-block-user > span",
@@ -417,7 +438,43 @@ def nombre_de_fila(page, fila) -> str:
     return ""
 
 
-def buscar(page, usuario: str, timeout_s: float = 15.0):
+def esta_cargando(page) -> bool:
+    """True si el panel todavia esta buscando (el overlay 'We are looking for')."""
+    for sel in SEL_CARGANDO:
+        try:
+            if page.locator(sel).first.is_visible(timeout=250):
+                return True
+        except (PWTimeout, PWError):
+            continue
+    return False
+
+
+def esperar_busqueda(page, timeout_s: float) -> bool:
+    """Espera a que el panel termine de buscar. False si nunca termino.
+
+    La plataforma esta en Moscu: desde aca cada consulta se paga en cientos de
+    milisegundos, y con la cuenta cargada el panel tarda varios segundos. Por eso
+    se espera al overlay en vez de poner un sleep fijo, que o queda corto los
+    dias lentos o desperdicia tiempo en todas las cargas.
+    """
+    limite = time.monotonic() + timeout_s
+    vi_el_overlay = False
+
+    while time.monotonic() < limite:
+        if esta_cargando(page):
+            vi_el_overlay = True
+            page.wait_for_timeout(250)
+            continue
+        if vi_el_overlay:
+            # El panel saca el overlay un instante ANTES de pintar las filas.
+            page.wait_for_timeout(500)
+        return True
+
+    log.warning("  el panel siguio buscando mas de %.0fs y no termino", timeout_s)
+    return False
+
+
+def buscar(page, usuario: str, timeout_s: float = 45.0):
     """Filtra por `usuario` y devuelve la fila SOLO si es EXACTAMENTE ese.
 
     El match exacto evita el peor error posible: buscar 'fauno2' trae tambien
@@ -434,9 +491,14 @@ def buscar(page, usuario: str, timeout_s: float = 15.0):
     # El panel aclara "introducir texto solo en minusculas" al lado del campo.
     caja.type(usuario.lower(), delay=50)
 
+    # El desplegable de coincidencias sale primero en blanco, con el overlay
+    # "We are looking for.." adentro: si se lo mira ahi, no hay ninguna opcion
+    # para clickear y se pierde el atajo. Se le da tiempo a que resuelva.
+    esperar_busqueda(page, timeout_s)
+
     # Si aparece el desplegable de coincidencias, elegir la opcion ya deja el
     # filtro puesto y ahorra el paso siguiente.
-    sug = primero(page, SEL_SUGERENCIA, 3_000)
+    sug = primero(page, SEL_SUGERENCIA, 5_000)
     if sug is not None:
         try:
             sug.click(timeout=4_000)
@@ -458,14 +520,40 @@ def buscar(page, usuario: str, timeout_s: float = 15.0):
         except (PWTimeout, PWError):
             pass
 
+    # ANTES de mirar la tabla: si el overlay sigue puesto, lo que hay abajo es
+    # el resultado de la busqueda anterior.
+    esperar_busqueda(page, timeout_s)
+
     limite = time.monotonic() + timeout_s
     visto = ""
+    vacias = 0          # veces seguidas que la tabla dijo "no hay resultados"
+
     while time.monotonic() < limite:
+        # Puede volver a buscar sola (repinta al aplicar el filtro).
+        if esta_cargando(page):
+            vacias = 0
+            page.wait_for_timeout(250)
+            continue
+
         fila = primero(page, SEL_FILA, 1_000)
         if fila is not None:
             visto = nombre_de_fila(page, fila)
             if visto.lower() == usuario.lower():
                 return fila
+
+            # Con la busqueda YA terminada, "no se encontraron resultados"
+            # empieza a ser una respuesta y no un estado intermedio. Se pide
+            # tres veces seguidas (~1s) por si es el parpadeo del repintado:
+            # sin eso volveriamos a creerle a la tabla demasiado pronto, que es
+            # el bug que estamos arreglando.
+            if any(t in visto.lower() for t in TXT_SIN_RESULTADOS):
+                vacias += 1
+                if vacias >= 3:
+                    log.warning("  el panel dice que '%s' no existe", usuario)
+                    break
+            else:
+                vacias = 0
+
         page.wait_for_timeout(300)
 
     log.warning("  la primera fila quedo en '%s', no en '%s'", visto or "(vacia)", usuario)
