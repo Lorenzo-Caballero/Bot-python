@@ -42,8 +42,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("sync")
 
-PANEL_API = "https://agents.ganamosonline.com/api"
-USERS_URL = "https://agents.ganamosonline.com/users/all"
+PANEL_API = "https://agents.ganamos7.com/api"
+USERS_URL = "https://agents.ganamos7.com/users/all"
 POR_PAGINA = 50          # cuantos usuarios por pagina de la API
 LOTE_POST = 300          # cuantos mandamos por request a nuestro server
 PAUSA_PAGINA = 0.4       # segundos entre paginas (gentil con el WAF)
@@ -85,7 +85,32 @@ def normalizar(u: dict) -> dict:
     }
 
 
-def traer_todos(ctx) -> list[dict]:
+def mostrar_campos(u: dict) -> None:
+    """
+    Imprime TODO lo que devuelve el panel para un jugador.
+
+    normalizar() se queda con 8 campos y tira el resto, asi que sin esto no hay
+    forma de saber que mas hay disponible. Sirve para dos preguntas concretas:
+    si el panel informa la ULTIMA CONEXION (y entonces el login se detecta desde
+    acá, sin depender del navegador del jugador), y si trae el email.
+    """
+    print("\n--- campos que devuelve el panel para un jugador ---")
+    for k in sorted(u.keys()):
+        v = u[k]
+        if isinstance(v, (dict, list)):
+            v = f"<{type(v).__name__}>"
+        print(f"  {k:28} = {v}")
+    print("---------------------------------------------------\n")
+
+    pistas = [k for k in u
+              if any(t in k.lower() for t in ("last", "login", "seen", "activ", "online", "mail"))]
+    if pistas:
+        print("Campos que podrian servir:", ", ".join(pistas))
+    else:
+        print("No hay ningun campo de ultima conexion ni de email.")
+
+
+def traer_todos(ctx, solo_campos: bool = False) -> list[dict]:
     """Pagina la API del panel y devuelve la lista completa de usuarios."""
     me = ctx.request.get(f"{PANEL_API}/user/check").json()
     agent_id = me["result"]["id"]
@@ -99,6 +124,9 @@ def traer_todos(ctx) -> list[dict]:
         items = items_de(data) or []
         if not items:
             break
+        if solo_campos:
+            mostrar_campos(items[0])
+            return []
         todos.extend(normalizar(u) for u in items)
         pag += 1
         if pag % 10 == 0:
@@ -202,7 +230,7 @@ def guardar(usuarios: list[dict], ctx=None, page=None) -> None:
     log.info("Guardados en la base: %d (via navegador)", total)
 
 
-def una_pasada(headless: bool) -> int:
+def una_pasada(headless: bool, solo_campos: bool = False) -> int:
     with sync_playwright() as p:
         browser, ctx = bot.nuevo_contexto(p, headless=headless, con_sesion=True)
         page = ctx.new_page()
@@ -220,7 +248,11 @@ def una_pasada(headless: bool) -> int:
                 return 1
             bot.guardar_sesion(ctx, page)
 
-        usuarios = traer_todos(ctx)
+        usuarios = traer_todos(ctx, solo_campos=solo_campos)
+
+        if solo_campos:
+            browser.close()
+            return 0
 
         if usuarios:
             # Guardamos con el navegador AUN abierto: si el WAF de Hostinger
@@ -236,7 +268,14 @@ def main() -> int:
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--loop", type=int, metavar="SEG",
                     help="repetir cada SEG segundos (espejo casi en vivo)")
+    ap.add_argument("--campos", action="store_true",
+                    help="mostrar todos los campos que devuelve el panel para un "
+                         "jugador y salir (no guarda nada)")
     args = ap.parse_args()
+
+    # --campos solo lee el panel, no le manda nada a la API propia.
+    if args.campos:
+        return una_pasada(args.headless, solo_campos=True)
 
     if not os.environ.get("API_URL") or not os.environ.get("API_KEY"):
         log.error("Faltan API_URL / API_KEY en el .env")

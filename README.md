@@ -1,6 +1,6 @@
 # ganamos-bot
 
-Bots de Playwright que operan el panel de agentes `agents.ganamosonline.com`,
+Bots de Playwright que operan el panel de agentes `agents.ganamos7.com`,
 empaquetados para correr en un VPS con Docker.
 
 | Servicio | Script | Qué hace |

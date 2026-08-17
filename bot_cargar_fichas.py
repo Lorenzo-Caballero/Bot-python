@@ -47,7 +47,7 @@ load_dotenv()
 
 log = logging.getLogger("fichas")
 
-URL_USUARIOS = "https://agents.ganamosonline.com/users/all"
+URL_USUARIOS = "https://agents.ganamos7.com/users/all"
 
 # ---------------------------------------------------------------------------
 # Selectores del panel
@@ -138,7 +138,17 @@ SEL_RETIRAR_EN_FILA = [
 # La pantalla de retiro es la hermana de la de deposito. No se conoce su ruta,
 # asi que se aceptan las formas habituales y, si no, alcanza con que aparezca el
 # campo del monto (que se busca con los mismos selectores).
-RX_URL_RETIRO = re.compile(r"/user/(withdraw|retiro|retirar|payout|cashout)/(\d+)")
+RX_URL_RETIRO = re.compile(r"/user/(withdrawal|withdraw|retiro|retirar|payout)/(\d+)")
+
+# El campo del monto del retiro NO comparte markup con el del deposito: alla es
+# deposit-mobile__inputs, aca withdrawal-mobile__row. El placeholder ("Cantidad")
+# si es el mismo en las dos, asi que sirve de ancla comun.
+SEL_RET_MONTO = [
+    f"{_CONT} > div > div.withdrawal-mobile__row > div > div.input__wrapper > input",
+    '[class*="withdrawal"] div.input__wrapper > input',
+    '[class*="withdrawal"] input',
+    'input[placeholder="Cantidad"]',
+]
 
 SEL_RET_CONFIRMAR = [
     'button:has-text("Retiro")',

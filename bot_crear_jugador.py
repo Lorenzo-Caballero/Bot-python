@@ -1,5 +1,5 @@
 """
-Bot de creacion automatica de jugadores en agents.ganamosonline.com
+Bot de creacion automatica de jugadores en agents.ganamos7.com
 
 Flujo:
     login.php -> tabla jugadores -> cola_panel.php -> este bot -> panel
@@ -39,8 +39,8 @@ Operacion:
 Archivo .env (esta en .gitignore, no subirlo):
     API_URL=https://mi-dominio.com/api/jugadores.php
     API_KEY=una-clave-larga-y-random
-    PANEL_URL=https://agents.ganamosonline.com/user/create-player
-    LOGIN_URL=https://agents.ganamosonline.com/
+    PANEL_URL=https://agents.ganamos7.com/user/create-player
+    LOGIN_URL=https://agents.ganamos7.com/
     PANEL_USER=...
     PANEL_PASS=...
     POLL_SEGUNDOS=30
@@ -95,12 +95,12 @@ SHOTS.mkdir(exist_ok=True)
 # DESTINO
 # ---------------------------------------------------------------------------
 PANEL_URL = os.environ.get(
-    "PANEL_URL", "https://agents.ganamosonline.com/user/create-player"
+    "PANEL_URL", "https://agents.ganamos7.com/user/create-player"
 )
-LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamosonline.com/login")
+LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamos7.com/login")
 
 # Host del panel: se usa para distinguir el POST real de la telemetria
-HOST_PANEL = "ganamosonline.com"
+HOST_PANEL = "ganamos7.com"
 
 # Credenciales del panel de agentes. NUNCA hardcodear aca: van en el .env,
 # que esta en .gitignore. Si faltan, el bot cae al login manual (--login).
