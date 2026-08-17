@@ -97,7 +97,11 @@ SHOTS.mkdir(exist_ok=True)
 PANEL_URL = os.environ.get(
     "PANEL_URL", "https://agents.ganamos7.com/user/create-player"
 )
-LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamos7.com/login")
+# La pantalla de login vive en la RAIZ, no en /login: el panel es un SPA y esa
+# ruta no existe (te deja en una pagina sin el campo de password, y el bot falla
+# con "No encontre los campos del login"). Mismo motivo por el que
+# es_pantalla_login() busca el boton 'Acceder' en vez de mirar la URL.
+LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamos7.com/")
 
 # Host del panel: se usa para distinguir el POST real de la telemetria
 HOST_PANEL = "ganamos7.com"
