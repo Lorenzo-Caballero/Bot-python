@@ -486,7 +486,20 @@ def buscar(page, usuario: str, timeout_s: float = 45.0):
         log.warning("  no encontre el buscador de usuarios en el panel")
         return None
 
-    caja.click(timeout=10_000)
+    # ANTES de tocar el buscador: al cargar la pagina hay un spinner
+    # (spinner-desktop sobre users__center) que tapa todo. El buscador ya esta
+    # "visible y habilitado" pero el spinner intercepta el click, y Playwright
+    # reintenta 10s y se rinde con TimeoutError. Se espera a que se vaya.
+    esperar_busqueda(page, timeout_s)
+
+    # Aun asi, el click puede caer en el instante en que el spinner reaparece
+    # (el panel repinta al filtrar). Un reintento propio evita morir por eso.
+    try:
+        caja.click(timeout=10_000)
+    except (PWTimeout, PWError):
+        log.info("  el click al buscador se topo con el overlay; espero y reintento")
+        esperar_busqueda(page, timeout_s)
+        caja.click(timeout=10_000)
     caja.fill("")
     # El panel aclara "introducir texto solo en minusculas" al lado del campo.
     caja.type(usuario.lower(), delay=50)
