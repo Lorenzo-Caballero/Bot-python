@@ -631,29 +631,32 @@ def login_automatico(page) -> bool:
 
 
 def abrir_formulario(page) -> None:
-    if PANEL_URL.rstrip("/") not in page.url.rstrip("/"):
-        page.goto(PANEL_URL, wait_until="domcontentloaded")
-    else:
-        page.reload(wait_until="domcontentloaded")   # form limpio para el siguiente
+    # Siempre goto, nunca reload(): el panel es un SPA y despues de un alta
+    # queda en /users/all. Recargar ESA ruta no reconstruye el formulario --
+    # hay que navegar de nuevo a la del form. Y si ya estamos en la ruta
+    # correcta, goto igual la rearma limpia para el alta siguiente.
+    page.goto(PANEL_URL, wait_until="domcontentloaded")
 
     if es_pantalla_login(page):
         raise SesionExpirada(page.url)
 
+    def form_a_la_vista(espera_ms: int) -> bool:
+        """True si aparecio alguno de los FORM_SELS y esta visible."""
+        sel = primer_selector(page, FORM_SELS, espera_ms)
+        try:
+            page.wait_for_selector(sel, timeout=espera_ms, state="visible")
+            return True
+        except PWTimeout:
+            return False
+
     # El panel es un SPA: recien salido de domcontentloaded el <form> todavia
-    # no existe, aunque la URL ya sea la del formulario. Preguntar aca por
-    # locator(FORM).count() da 0 SIEMPRE, y entonces el bot se aprieta el boton
-    # del subheader en cada alta y se va de la pagina. Primero se espera.
-    try:
-        # Cualquiera de los FORM_SELS: el panel viejo y el nuevo no lo llaman
-        # igual. primer_selector espera a que aparezca alguno.
-        page.wait_for_selector(primer_selector(page, FORM_SELS, 10_000), timeout=10_000)
+    # no existe, aunque la URL ya sea la del formulario. Por eso se ESPERA en
+    # vez de preguntar por count(), que da 0 SIEMPRE en ese momento.
+    if form_a_la_vista(10_000):
         return
-    except PWTimeout:
-        pass
 
     # No aparecio solo: recien ahi tiene sentido el boton "Crear usuario" del
-    # listado. Best-effort: si el markup del subheader cambio, se deja que
-    # falle el wait de abajo, que explica mucho mejor lo que paso.
+    # listado. Best-effort: si el markup del subheader cambio, seguimos igual.
     if SEL_ABRIR_MODAL:
         boton = page.locator(SEL_ABRIR_MODAL)
         if boton.count() > 0:
@@ -662,9 +665,31 @@ def abrir_formulario(page) -> None:
                 boton.first.click(timeout=5_000)
             except (PWTimeout, PWError) as e:
                 log.warning("No pude clickear 'Crear usuario': %s", e)
+            if form_a_la_vista(10_000):
+                return
 
-    # Mismo criterio que arriba: cualquiera de los FORM_SELS.
-    page.wait_for_selector(primer_selector(page, FORM_SELS, 15_000), timeout=15_000)
+    # Ultimo intento: navegacion limpia esperando a que la red se calme. Un SPA
+    # que venia de otra ruta a veces necesita eso y no un domcontentloaded.
+    log.info("  el form sigue sin aparecer, recargo la pagina entera")
+    try:
+        page.goto(PANEL_URL, wait_until="networkidle", timeout=25_000)
+    except PWTimeout:
+        pass
+    if es_pantalla_login(page):
+        raise SesionExpirada(page.url)
+    if form_a_la_vista(15_000):
+        return
+
+    # Se rinde, pero diciendo DONDE quedo. "waiting for locator('form')" no
+    # sirve para nada: lo util es la URL y una captura de lo que se ve.
+    try:
+        page.screenshot(path=str(SHOTS / "sin_formulario.png"))
+    except Exception:
+        pass
+    raise RuntimeError(
+        f"No aparecio el formulario de alta en {page.url} "
+        f"(captura en {SHOTS}/sin_formulario.png)"
+    )
 
 
 def sesion_viva(page) -> bool:
