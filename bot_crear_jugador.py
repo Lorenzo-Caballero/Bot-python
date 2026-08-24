@@ -119,7 +119,20 @@ class SesionExpirada(Exception):
 # ---------------------------------------------------------------------------
 # SELECTORES  (sacados del outerHTML que pasaste)
 # ---------------------------------------------------------------------------
-FORM = "form.create-player__form"
+# El <form> no se llama igual en los dos paneles: en agents.ganamos7.com lleva
+# la clase create-player__form y en agents.ganamosonline.com el <form> viene
+# PELADO, sin clase. Lo unico estable en los dos es el contenedor de campos que
+# tiene adentro (.create-player__fields), asi que se reconoce por ahi.
+FORM_SELS = [
+    "form.create-player__form",          # panel nuevo
+    "form:has(.create-player__fields)",  # panel viejo: el form no tiene clase
+    "form:has(input[placeholder='Nombre de usuario'])",
+    "form",                              # ultimo recurso
+]
+# Se sigue usando como prefijo de los selectores "preferidos" de cada campo.
+# Cada campo ademas tiene alternativas SIN prefijo, que son las que salvan
+# cuando el form no matchea (ver SEL).
+FORM = FORM_SELS[0]
 
 # Cada campo lleva VARIOS selectores, que se prueban en orden hasta que uno
 # aparezca (ver primer_selector). El panel es un React sin `name` en algunos
@@ -134,35 +147,48 @@ SEL = {
     # OJO: este input NO tiene atributo name, va por placeholder
     "usuario": [
         f"{FORM} input[placeholder='Nombre de usuario']",
-        f"{FORM} .create-player__fields > div:nth-child(1) input",
+        "input[placeholder='Nombre de usuario']",
+        ".create-player__fields > div:nth-child(1) input",
     ],
     "email": [
         f"{FORM} input[name='email']",
-        f"{FORM} input[placeholder='Correo electrónico']",
-        f"{FORM} .create-player__fields > div:nth-child(2) input",
+        "input[name='email']",
+        "input[placeholder='Correo electrónico']",
+        ".create-player__fields > div:nth-child(2) input",
     ],
     "password": [
         f"{FORM} input[name='password']",
-        f"{FORM} input[placeholder='Contraseña']",
-        f"{FORM} .create-player__fields > div:nth-child(3) input",
+        "input[name='password']",
+        "input[placeholder='Contraseña']",
+        ".create-player__fields > div:nth-child(3) input",
     ],
     "confirm": [
         f"{FORM} input[name='confirmPassword']",
-        f"{FORM} input[placeholder='Confirmar contraseña']",
-        f"{FORM} .create-player__fields > div:nth-child(5) input",
+        "input[name='confirmPassword']",
+        "input[placeholder='Confirmar contraseña']",
+        ".create-player__fields > div:nth-child(5) input",
     ],
     "nombre": [
         f"{FORM} input[name='name']",
-        f"{FORM} input[placeholder='Nombre']",
-        f"{FORM} .create-player__fields > div:nth-child(4) input",
+        "input[name='name']",
+        "input[placeholder='Nombre']:not([placeholder*='usuario'])",
+        ".create-player__fields > div:nth-child(4) input",
     ],
     "apellido": [
         f"{FORM} input[name='surname']",
-        f"{FORM} input[placeholder='Apellido']",
-        f"{FORM} .create-player__fields > div:nth-child(6) input",
+        "input[name='surname']",
+        "input[placeholder='Apellido']",
+        ".create-player__fields > div:nth-child(6) input",
     ],
-    "btn_crear":  [f"{FORM} button[type='submit']"],
-    "btn_cancel": [f"{FORM} button:has-text('Cancelar')"],
+    "btn_crear": [
+        f"{FORM} button[type='submit']",
+        "form button[type='submit']",
+        "button:has-text('CREAR JUGADOR')",
+    ],
+    "btn_cancel": [
+        f"{FORM} button:has-text('Cancelar')",
+        "form button:has-text('Cancelar')",
+    ],
 }
 
 
@@ -614,7 +640,9 @@ def abrir_formulario(page) -> None:
     # locator(FORM).count() da 0 SIEMPRE, y entonces el bot se aprieta el boton
     # del subheader en cada alta y se va de la pagina. Primero se espera.
     try:
-        page.wait_for_selector(FORM, timeout=10_000)
+        # Cualquiera de los FORM_SELS: el panel viejo y el nuevo no lo llaman
+        # igual. primer_selector espera a que aparezca alguno.
+        page.wait_for_selector(primer_selector(page, FORM_SELS, 10_000), timeout=10_000)
         return
     except PWTimeout:
         pass
@@ -631,7 +659,8 @@ def abrir_formulario(page) -> None:
             except (PWTimeout, PWError) as e:
                 log.warning("No pude clickear 'Crear usuario': %s", e)
 
-    page.wait_for_selector(FORM, timeout=15_000)
+    # Mismo criterio que arriba: cualquiera de los FORM_SELS.
+    page.wait_for_selector(primer_selector(page, FORM_SELS, 15_000), timeout=15_000)
 
 
 def sesion_viva(page) -> bool:
