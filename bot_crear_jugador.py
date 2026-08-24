@@ -699,11 +699,39 @@ def crear_jugador(page, reg: dict, dry_run: bool = False) -> tuple[bool, str]:
     if resp.ok:
         return True, f"HTTP {resp.status} {resp.url}"
 
+    # 3xx NO es un fallo: despues de un POST, redirigir es la forma normal de
+    # decir "listo" (POST-Redirect-GET, para que un F5 no reenvie el alta). El
+    # panel lo usa, y como resp.ok solo acepta 2xx, el alta terminaba marcada
+    # como error aunque el jugador hubiera quedado creado.
+    #
+    # Encima un redirect no tiene cuerpo: resp.text() lanza
+    # "Response body is unavailable for redirect responses" y se llevaba
+    # puesta la vuelta entera del bot.
+    #
+    # No se asume que salio bien por ver un 3xx: se confirma mirando la
+    # pantalla, que es lo unico que dice si el jugador quedo creado.
+    if 300 <= resp.status < 400:
+        ok, detalle = resultado_visual(page)
+        if ok is None:
+            # Ni confirmado ni desmentido. Se devuelve error para que la cola
+            # lo reintente: mejor un reintento que se choca con "usuario ya
+            # existe" que dar por creada una cuenta que capaz no existe.
+            page.screenshot(path=str(SHOTS / f"redirect_{reg['id']}.png"))
+            return False, (f"HTTP {resp.status} redirigio a {resp.url} y no pude "
+                           f"confirmar en pantalla ({detalle})")
+        return ok, f"HTTP {resp.status} redirect - {detalle}"
+
     detalle = ""
     try:
         detalle = json.dumps(resp.json(), ensure_ascii=False)[:300]
     except Exception:
-        detalle = (resp.text() or "")[:300]
+        # .text() tambien puede fallar (cuerpo ya liberado, respuesta sin
+        # cuerpo). Que el bot no se caiga por no poder leer el detalle del
+        # error: el status y la URL ya dicen bastante.
+        try:
+            detalle = (resp.text() or "")[:300]
+        except Exception as e:
+            detalle = f"(sin cuerpo legible: {e})"
 
     page.screenshot(path=str(SHOTS / f"rechazado_{reg['id']}.png"))
     return False, f"HTTP {resp.status} - {detalle}"
