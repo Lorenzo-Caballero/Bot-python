@@ -521,7 +521,10 @@ def tipear(page, selector, valor: str) -> None:
     loc.wait_for(state="visible", timeout=10_000)
     loc.click()
     loc.fill("")                                   # limpia
-    loc.press_sequentially(str(valor), delay=random.randint(30, 80))
+    # 30-80ms por tecla eran ~5 s solo en llenar el form. React registra igual
+    # con 8-18: lo que importa es que sean eventos de teclado de verdad, no la
+    # lentitud. Multiplicado por cada alta y cada reintento, se nota.
+    loc.press_sequentially(str(valor), delay=random.randint(8, 18))
     loc.press("Tab")                               # blur -> dispara validacion
 
 
@@ -916,30 +919,49 @@ def enviar_formulario(page, reg: dict) -> tuple[bool | None, str]:
     Devuelve (True|False|None, detalle). None = ni exito ni error reconocible;
     el caller decide si reintenta.
     """
-    # UN solo click, y despues mirar.
+    # Varias formas de enviar, en orden, hasta que una de una señal.
     #
-    # Antes se clickeaba el boton y enseguida se llamaba a confirmar_modal(),
-    # dando por hecho que el panel pedia una confirmacion aparte. Pero el
-    # formulario de alta VIVE DENTRO del modal (#modal-root): confirmar_modal
-    # encontraba ESE MISMO boton "CREAR JUGADOR" y lo apretaba de nuevo. El
-    # segundo click caia sobre un boton que ya estaba procesando y el alta se
-    # quedaba a medio camino, con el form lleno en pantalla y sin POST.
-    page.click(primer_selector(page, SEL["btn_crear"]))
+    # Con una sola no alcanzaba: el boton no tiene type='submit', el form vive
+    # dentro del modal y clickearlo no siempre dispara el submit de React. En
+    # vez de adivinar cual anda, se prueban y se loguea la que funciono.
+    #
+    # OJO con confirmar_modal(): el form de alta VIVE dentro de #modal-root, asi
+    # que ahi encuentra ESE MISMO boton. Por eso se llama una sola vez y recien
+    # despues del primer intento, nunca en cada vuelta.
+    intentos = [
+        ("click en el boton",
+         lambda: page.click(primer_selector(page, SEL["btn_crear"]), timeout=8_000)),
+        ("click por texto",
+         lambda: page.get_by_role("button", name=RX_CONFIRMAR).first.click(timeout=8_000)),
+        ("Enter en el ultimo campo",
+         lambda: page.locator(primer_selector(page, SEL["apellido"])).first.press("Enter")),
+    ]
 
-    # Camino normal: el panel navega al listado. Se le da un rato corto antes
-    # de buscar cualquier confirmacion, porque casi siempre alcanza con esto.
-    url = esperar_salida_del_form(page, 8_000)
-    if url:
-        return True, f"redirigio a {url}"
+    for como, accion in intentos:
+        try:
+            accion()
+        except (PWTimeout, PWError) as e:
+            log.debug("  %s no salio: %s", como, e)
+            continue
 
-    # Sigue en el form. AHORA si tiene sentido buscar un modal de confirmacion
-    # -- pero solo si trae un boton distinto del que ya apretamos.
-    detalle_modal = confirmar_modal(page)
-    if detalle_modal != "sin modal":
-        log.info("  %s", detalle_modal)
-        url = esperar_salida_del_form(page, 12_000)
+        url = esperar_salida_del_form(page, 6_000)
         if url:
-            return True, f"redirigio a {url} ({detalle_modal})"
+            return True, f"redirigio a {url} [{como}]"
+
+        # Puede haber una confirmacion aparte. Solo se prueba una vez.
+        if como == intentos[0][0]:
+            detalle_modal = confirmar_modal(page, timeout_ms=4_000)
+            if detalle_modal != "sin modal":
+                log.info("  %s", detalle_modal)
+                url = esperar_salida_del_form(page, 8_000)
+                if url:
+                    return True, f"redirigio a {url} ({detalle_modal})"
+
+        # Si el panel ya marco un error, no tiene sentido seguir probando.
+        if errores_de_validacion(page):
+            break
+
+    detalle_modal = ""
 
     errores = errores_de_validacion(page)
     if errores:
@@ -1382,7 +1404,10 @@ def main() -> int:
         log.error("%s", e)
         return 1
 
-    poll = int(os.environ.get("POLL_SEGUNDOS", 30))
+    # 10 s y no 30: del otro lado hay alguien mirando "creando tu cuenta". La
+    # consulta es un GET a nuestra propia API, no al panel, asi que sondear mas
+    # seguido no molesta a nadie. Se puede subir con POLL_SEGUNDOS en el .env.
+    poll = int(os.environ.get("POLL_SEGUNDOS", 10))
 
     with sync_playwright() as p:
         browser, ctx = nuevo_contexto(p, headless=args.headless, con_sesion=True)
@@ -1457,7 +1482,10 @@ def main() -> int:
                     # a todas las que vienen atras.
                     recuperar_pagina(page)
 
-                    time.sleep(random.uniform(2, 4))   # respirar entre cargas
+                    # Pausa corta entre altas. Existe para no martillar el
+                    # panel, pero 2-4 s se sentian de mas cuando hay varias en
+                    # cola: el jugador ya esta esperando del otro lado.
+                    time.sleep(random.uniform(0.8, 1.5))
 
                 # Cargas de saldo, en el MISMO navegador. Dos procesos con la
                 # misma cuenta de agente se pisan la sesion, asi que conviene
