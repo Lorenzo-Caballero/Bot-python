@@ -87,8 +87,12 @@ log = logging.getLogger("bot")
 
 SESION_FILE = Path("estado_sesion.json")
 SESSION_STORAGE_FILE = Path("estado_session_storage.json")
-SHOTS = Path("capturas")
-SHOTS.mkdir(exist_ok=True)
+# Las capturas van al volumen montado si existe (/datos en docker-compose).
+# Antes caian en /app/capturas, que vive DENTRO del contenedor y no esta
+# mapeado: se perdian en cada --force-recreate, justo cuando mas se necesitan
+# para ver que mostraba el panel en el momento del fallo.
+SHOTS = Path("/datos/capturas") if Path("/datos").is_dir() else Path("capturas")
+SHOTS.mkdir(parents=True, exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +854,19 @@ def crear_jugador(page, reg: dict, dry_run: bool = False) -> tuple[bool, str]:
         if errores:
             motivo = " | ".join(errores[:3])
             return False, f"El panel rechazo el formulario: {motivo}"
+
+        # Ni POST ni mensaje de error reconocible. Se vuelca el HTML del form
+        # para poder mirarlo despues: sin esto solo queda "no se detecto la
+        # respuesta", que no alcanza para saber si el boton quedo apagado, si
+        # hay un overlay tapando, o si el panel muestra el error de una forma
+        # que todavia no contemplamos.
+        try:
+            html = page.locator(primer_selector(page, FORM_SELS, 2_000)).first.inner_html(timeout=3_000)
+            destino = SHOTS / f"form_{reg['id']}.html"
+            destino.write_text(html, encoding="utf-8")
+            log.warning("  volque el HTML del form en %s", destino)
+        except Exception as e:
+            log.debug("no pude volcar el form: %s", e)
 
         if ok is None:
             return False, f"No se detecto la respuesta del servidor tras enviar. {detalle}"
