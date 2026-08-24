@@ -672,6 +672,31 @@ def sesion_viva(page) -> bool:
         return False
 
 
+def recuperar_pagina(page) -> None:
+    """Deja la pagina lista para el proximo alta, pase lo que pase.
+
+    Un alta que falla puede dejar el modal abierto, un overlay tapando todo o
+    el formulario a medio llenar. El siguiente alta arranca ahi y se cuelga
+    esperando algo que no va a pasar -- que es como el bot quedo "clavado"
+    despues de un FALLO, sin volver a mirar la cola.
+
+    Todo best-effort y con timeouts cortos: esto es limpieza, no puede ser lo
+    que rompa el loop.
+    """
+    # 1) Cerrar el modal si quedo abierto (Escape es lo menos invasivo).
+    try:
+        # press() no acepta timeout (solo `delay`): pasarselo tira TypeError.
+        page.keyboard.press("Escape")
+    except Exception:
+        pass
+    # 2) Volver al formulario limpio. Si ni esto sale, el proximo alta lo
+    #    intenta de nuevo por su cuenta.
+    try:
+        page.goto(PANEL_URL, wait_until="domcontentloaded", timeout=15_000)
+    except Exception as e:
+        log.debug("no pude recuperar la pagina: %s", e)
+
+
 def errores_de_validacion(page) -> list[str]:
     """Los mensajes de error que el panel muestra JUNTO A LOS CAMPOS.
 
@@ -1261,6 +1286,7 @@ def main() -> int:
         # (otro dominio => otro cliente => otra base). Ahora lo dice.
         api.diagnostico()
 
+        ultimo_latido = time.monotonic()
         try:
             while True:
                 try:
@@ -1306,6 +1332,11 @@ def main() -> int:
                     if not args.dry_run:
                         api.marcar(reg["id"], "ok" if ok else "error", msg)
 
+                    # Que el proximo alta arranque en un estado conocido. Sin
+                    # esto, un fallo que deja el modal abierto se lleva puestas
+                    # a todas las que vienen atras.
+                    recuperar_pagina(page)
+
                     time.sleep(random.uniform(2, 4))   # respirar entre cargas
 
                 # Cargas de saldo, en el MISMO navegador. Dos procesos con la
@@ -1329,6 +1360,16 @@ def main() -> int:
 
                 if args.once:
                     break
+
+                # Latido cada ~10 min. El loop no loguea nada cuando la cola
+                # esta vacia, asi que "todo tranquilo" y "el bot se colgo" se
+                # veian igual en pantalla -- y esperar 30 s mirando un log
+                # quieto no dice cual de las dos es.
+                ahora = time.monotonic()
+                if ahora - ultimo_latido >= 600:
+                    ultimo_latido = ahora
+                    log.info("escuchando (cola vacia)")
+
                 time.sleep(poll)
 
         except KeyboardInterrupt:
