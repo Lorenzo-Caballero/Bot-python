@@ -381,13 +381,22 @@ class ApiJugadores:
         r.raise_for_status()
         return int(r.json().get("liberados", 0))
 
-    def marcar(self, registro_id, estado: str, mensaje: str = "") -> None:
-        """estado: 'ok' | 'error'"""
+    def marcar(self, registro_id, estado: str, mensaje: str = "",
+               password: str = "") -> None:
+        """estado: 'ok' | 'error'
+
+        `password` es la clave REAL con la que quedo la cuenta. El panel genera
+        la suya y descarta la que tipeamos, asi que la que teniamos encolada no
+        sirve para entrar. Si se pudo leer de la pantalla, viaja aca y el server
+        la guarda para entregarsela al jugador."""
+        cuerpo = {"id": registro_id, "estado": estado, "mensaje": mensaje[:500]}
+        if password:
+            cuerpo["password"] = password[:128]
         try:
             r = self.s.post(
                 self.url,
                 params={"accion": "marcar"},
-                json={"id": registro_id, "estado": estado, "mensaje": mensaje[:500]},
+                json=cuerpo,
                 timeout=20,
             )
             r.raise_for_status()
@@ -610,6 +619,66 @@ def resultado_visual(page) -> tuple[bool | None, str]:
             return False, f"mensaje en pantalla: '{palabra}'"
 
     return None, "sin señales en pantalla"
+
+
+# Como se ve una clave en la pantalla de "jugador creado". El panel la muestra
+# junto al usuario; no sabemos con que markup, asi que se prueban varias formas
+# y se valida el formato antes de creerle a nada.
+RX_ETIQUETA_PASS = re.compile(
+    r"(?:contrase[nñ]a|password|clave|pass)\s*[:\-]?\s*([A-Za-z0-9._@#$%!-]{6,64})",
+    re.IGNORECASE,
+)
+
+
+def leer_password_del_panel(page, usuario: str) -> str:
+    """La clave con la que QUEDO la cuenta, leida de la pantalla del panel.
+
+    Existe porque el panel genera su propia clave e ignora la que tipeamos: la
+    que teniamos encolada no abre la cuenta. Si esto devuelve "", el server se
+    queda con la encolada -- que es mejor que nada, pero puede no servir.
+
+    Devuelve "" en vez de lanzar: no encontrar la clave no puede tirar abajo un
+    alta que el panel ya acepto.
+    """
+    candidatas = []
+
+    # 1) Inputs de la pantalla de resultado: a veces la clave queda en un
+    #    campo (a veces readonly) en vez de en texto suelto.
+    for sel in ("#modal-root input", "input[name='password']",
+                "input[readonly]", "input[type='text']"):
+        try:
+            for i in range(page.locator(sel).count()):
+                v = (page.locator(sel).nth(i).input_value(timeout=1_000) or "").strip()
+                if v:
+                    candidatas.append(v)
+        except PWError:
+            pass
+        except Exception:
+            pass
+
+    # 2) Texto de la pantalla, buscando la etiqueta.
+    for sel in (SEL_MODAL, "body"):
+        try:
+            txt = page.locator(sel).inner_text(timeout=2_000) or ""
+        except Exception:
+            continue
+        for m in RX_ETIQUETA_PASS.finditer(txt):
+            candidatas.append(m.group(1).strip())
+
+    # Filtrar lo que seguro NO es una clave.
+    for c in candidatas:
+        if len(c) < 6 or len(c) > 64:
+            continue
+        bajo = c.lower()
+        if bajo == usuario.lower():          # el usuario, no la clave
+            continue
+        if "@" in c and "." in c:            # el email que inventamos
+            continue
+        if bajo in ("password", "contrasena", "contraseña", "usuario"):
+            continue
+        return c
+
+    return ""
 
 
 def confirmar_modal(page, timeout_ms: int = 8_000, rx: re.Pattern = None) -> str:
@@ -1164,13 +1233,32 @@ def main() -> int:
                         log.exception("Excepcion en %s", etiqueta)
                         ok, msg = False, f"Excepcion: {e}"
 
+                    # La clave REAL: el panel genera la suya y descarta la
+                    # que tipeamos, asi que la encolada no abre la cuenta. Se
+                    # lee de la pantalla de resultado, que sigue a la vista.
+                    clave_real = ""
                     if ok:
-                        log.info("  OK  -> %s", msg)
+                        try:
+                            clave_real = leer_password_del_panel(page, reg["usuario"])
+                        except Exception as e:
+                            log.warning("  no pude leer la clave del panel: %s", e)
+
+                    if ok:
+                        if clave_real:
+                            log.info("  OK  -> %s (clave del panel leida, %d chars)",
+                                     msg, len(clave_real))
+                        else:
+                            # Importante que se vea: sin esto el jugador recibe
+                            # la clave que encolamos, que puede no servir.
+                            log.warning("  OK  -> %s  PERO no pude leer la clave "
+                                        "que genero el panel. Se entrega la "
+                                        "encolada, que capaz no abre la cuenta.", msg)
                     else:
                         log.warning("  FALLO -> %s", msg)
 
                     if not args.dry_run:
-                        api.marcar(reg["id"], "ok" if ok else "error", msg)
+                        api.marcar(reg["id"], "ok" if ok else "error", msg,
+                                   password=clave_real)
 
                     time.sleep(random.uniform(2, 4))   # respirar entre cargas
 
