@@ -672,6 +672,42 @@ def sesion_viva(page) -> bool:
         return False
 
 
+def errores_de_validacion(page) -> list[str]:
+    """Los mensajes de error que el panel muestra JUNTO A LOS CAMPOS.
+
+    Existe para el caso mas confuso: el bot llena el form, aprieta el boton, y
+    no sale ningun POST. Eso casi siempre es el panel rechazando algo (usuario
+    muy corto, clave que no cumple, correo repetido), pero desde afuera se veia
+    como "no se detecto la respuesta del servidor", que no dice nada y manda a
+    buscar el problema donde no esta.
+
+    Devuelve [] si no encuentra nada. No lanza: es diagnostico, no puede tirar
+    abajo el alta.
+    """
+    vistos = []
+    # Los paneles React suelen marcar el error con una clase que contiene
+    # "error", "invalid" o "helper". Se prueban varias y se filtra por texto
+    # visible, porque muchas quedan en el DOM vacias hasta que hay error.
+    for sel in ("[class*='error']", "[class*='invalid']", "[class*='helper']",
+                "[role='alert']", ".create-player__fields [class*='message']"):
+        try:
+            loc = page.locator(sel)
+            for i in range(min(loc.count(), 12)):
+                try:
+                    if not loc.nth(i).is_visible(timeout=500):
+                        continue
+                    t = (loc.nth(i).inner_text(timeout=500) or "").strip()
+                except Exception:
+                    continue
+                # Los contenedores grandes traen media pantalla adentro: solo
+                # sirve el texto corto, que es el mensajito del campo.
+                if t and 3 < len(t) < 160 and t not in vistos:
+                    vistos.append(t)
+        except Exception:
+            pass
+    return vistos
+
+
 def resultado_visual(page) -> tuple[bool | None, str]:
     """Plan B cuando no se detecto el POST: leer la pantalla.
 
@@ -778,6 +814,18 @@ def crear_jugador(page, reg: dict, dry_run: bool = False) -> tuple[bool, str]:
         ok, detalle = resultado_visual(page)
         page.screenshot(path=str(SHOTS / f"sin_respuesta_{reg['id']}.png"))
         detalle = f"{detalle} ({detalle_modal or 'no se llego al modal'})"
+
+        # Si no salio ningun POST, lo mas comun es que el panel haya rechazado
+        # el formulario y ni lo haya enviado. El motivo esta en pantalla, al
+        # lado del campo: sin esto el log decia "no se detecto la respuesta del
+        # servidor", que manda a buscar el problema en la red cuando en
+        # realidad el panel te esta diciendo que el usuario es muy corto o que
+        # el correo ya existe.
+        errores = errores_de_validacion(page)
+        if errores:
+            motivo = " | ".join(errores[:3])
+            return False, f"El panel rechazo el formulario: {motivo}"
+
         if ok is None:
             return False, f"No se detecto la respuesta del servidor tras enviar. {detalle}"
         return ok, f"sin POST detectado, {detalle}"
