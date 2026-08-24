@@ -121,17 +121,71 @@ class SesionExpirada(Exception):
 # ---------------------------------------------------------------------------
 FORM = "form.create-player__form"
 
+# Cada campo lleva VARIOS selectores, que se prueban en orden hasta que uno
+# aparezca (ver primer_selector). El panel es un React sin `name` en algunos
+# inputs, y ya nos paso que un cambio de markup dejara al bot tipeando en el
+# campo equivocado -- o en ninguno -- sin un error claro.
+#
+# El orden es a proposito: primero `name` (lo mas estable cuando esta), despues
+# el placeholder (visible en la pantalla, sobrevive a refactors de clases), y
+# recien al final la posicion dentro de .create-player__fields, que es lo mas
+# fragil porque se rompe si agregan un campo.
 SEL = {
     # OJO: este input NO tiene atributo name, va por placeholder
-    "usuario":   f"{FORM} input[placeholder='Nombre de usuario']",
-    "email":     f"{FORM} input[name='email']",
-    "password":  f"{FORM} input[name='password']",
-    "confirm":   f"{FORM} input[name='confirmPassword']",
-    "nombre":    f"{FORM} input[name='name']",
-    "apellido":  f"{FORM} input[name='surname']",
-    "btn_crear": f"{FORM} button[type='submit']",
-    "btn_cancel": f"{FORM} button:has-text('Cancelar')",
+    "usuario": [
+        f"{FORM} input[placeholder='Nombre de usuario']",
+        f"{FORM} .create-player__fields > div:nth-child(1) input",
+    ],
+    "email": [
+        f"{FORM} input[name='email']",
+        f"{FORM} input[placeholder='Correo electrónico']",
+        f"{FORM} .create-player__fields > div:nth-child(2) input",
+    ],
+    "password": [
+        f"{FORM} input[name='password']",
+        f"{FORM} input[placeholder='Contraseña']",
+        f"{FORM} .create-player__fields > div:nth-child(3) input",
+    ],
+    "confirm": [
+        f"{FORM} input[name='confirmPassword']",
+        f"{FORM} input[placeholder='Confirmar contraseña']",
+        f"{FORM} .create-player__fields > div:nth-child(5) input",
+    ],
+    "nombre": [
+        f"{FORM} input[name='name']",
+        f"{FORM} input[placeholder='Nombre']",
+        f"{FORM} .create-player__fields > div:nth-child(4) input",
+    ],
+    "apellido": [
+        f"{FORM} input[name='surname']",
+        f"{FORM} input[placeholder='Apellido']",
+        f"{FORM} .create-player__fields > div:nth-child(6) input",
+    ],
+    "btn_crear":  [f"{FORM} button[type='submit']"],
+    "btn_cancel": [f"{FORM} button:has-text('Cancelar')"],
 }
+
+
+def primer_selector(page, sels, timeout_ms: int = 8_000) -> str:
+    """El primero de `sels` que exista en la pagina.
+
+    Acepta un string suelto tambien, para no romper a los que ya llamaban con
+    uno solo. Si ninguno aparece devuelve el ultimo, para que el error que
+    lance Playwright nombre un selector de verdad y no uno inventado.
+    """
+    if isinstance(sels, str):
+        return sels
+    import time as _t
+    limite = _t.monotonic() + timeout_ms / 1000
+    while _t.monotonic() < limite:
+        for sel in sels:
+            try:
+                if page.locator(sel).count() > 0:
+                    return sel
+            except Exception:
+                pass
+        _t.sleep(0.2)
+    return sels[-1]
 
 # Selectores del login, verificados contra la pagina real.
 # Ojo: no hay <form>, los inputs no tienen name y el boton es type="button".
@@ -423,9 +477,12 @@ def restaurar_session_storage(ctx) -> None:
 # ---------------------------------------------------------------------------
 # Helpers de la pagina
 # ---------------------------------------------------------------------------
-def tipear(page, selector: str, valor: str) -> None:
-    """Escribe como humano para que React registre cada cambio."""
-    loc = page.locator(selector)
+def tipear(page, selector, valor: str) -> None:
+    """Escribe como humano para que React registre cada cambio.
+
+    `selector` puede ser un string o una lista de alternativas (ver SEL)."""
+    selector = primer_selector(page, selector)
+    loc = page.locator(selector).first
     loc.wait_for(state="visible", timeout=10_000)
     loc.click()
     loc.fill("")                                   # limpia
@@ -454,7 +511,7 @@ def esperar_habilitado(page, loc, timeout_ms: int = 10_000) -> bool:
 
 
 def esperar_boton_habilitado(page, timeout_ms: int = 10_000) -> bool:
-    return esperar_habilitado(page, page.locator(SEL["btn_crear"]).first, timeout_ms)
+    return esperar_habilitado(page, page.locator(primer_selector(page, SEL["btn_crear"])).first, timeout_ms)
 
 
 def estado_campos(page) -> list[str]:
@@ -679,7 +736,7 @@ def crear_jugador(page, reg: dict, dry_run: bool = False) -> tuple[bool, str]:
     detalle_modal = ""
     try:
         with page.expect_response(es_respuesta_de_creacion, timeout=30_000) as info:
-            page.click(SEL["btn_crear"])
+            page.click(primer_selector(page, SEL["btn_crear"]))
             # El POST NO sale con ese click: primero hay que confirmar el modal.
             # Esto va adentro del expect_response a proposito. Afuera, el bot
             # se quedaria esperando una respuesta que todavia nadie disparo,
