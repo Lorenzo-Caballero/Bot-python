@@ -854,6 +854,62 @@ def esperar_salida_del_form(page, timeout_ms: int = 20_000) -> str:
     return ""
 
 
+# Listado de jugadores del panel. Se deriva de PANEL_URL para no tener otra
+# URL suelta en el .env: .../user/create-player -> .../users/all
+URL_LISTADO = PANEL_URL.rsplit("/user/", 1)[0] + "/users/all"
+
+
+def existe_en_panel(page, usuario: str) -> bool | None:
+    """¿El jugador ya existe en el panel? True/False, o None si no se pudo ver.
+
+    Es la unica forma HONESTA de saber si un alta salio bien cuando el panel no
+    redirige ni muestra nada: se va al listado y se lo busca.
+
+    Sin esto quedaba la duda cara: dar por fallida un alta que en realidad
+    entro hace que el reintento choque con "usuario ya existe", y darla por
+    buena sin mirar entrega credenciales de una cuenta que capaz no existe.
+    """
+    try:
+        page.goto(URL_LISTADO, wait_until="domcontentloaded", timeout=20_000)
+    except Exception as e:
+        log.debug("no pude abrir el listado: %s", e)
+        return None
+
+    if es_pantalla_login(page):
+        raise SesionExpirada(page.url)
+
+    # primero() y los selectores del buscador viven en bot_cargar_fichas: es el
+    # que ya resolvio esta pantalla (incluido el "Aplicar Filtro", sin el cual
+    # tipear no filtra nada). Import adentro para no crear ciclo al importar.
+    try:
+        import bot_cargar_fichas as fichas
+    except Exception as e:
+        log.debug("no pude importar bot_cargar_fichas: %s", e)
+        return None
+
+    caja = fichas.primero(page, fichas.SEL_BUSCAR, 8_000)
+    if caja is None:
+        return None
+
+    try:
+        caja.click(timeout=5_000)
+        caja.fill("")
+        caja.press_sequentially(usuario, delay=40)
+        page.wait_for_timeout(400)
+        btn = fichas.primero(page, fichas.SEL_APLICAR, 3_000)
+        if btn is not None:
+            btn.click(timeout=5_000)
+        page.wait_for_timeout(1_500)
+        texto = (page.locator("body").inner_text(timeout=5_000) or "")
+    except Exception as e:
+        log.debug("no pude buscar en el listado: %s", e)
+        return None
+
+    # Comparacion laxa a proposito: el listado puede mostrarlo con otro
+    # formato, pero el nombre en si aparece igual.
+    return usuario.lower() in texto.lower()
+
+
 def enviar_formulario(page, reg: dict) -> tuple[bool | None, str]:
     """Aprieta crear, confirma el modal y espera una señal.
 
@@ -888,6 +944,15 @@ def enviar_formulario(page, reg: dict) -> tuple[bool | None, str]:
     errores = errores_de_validacion(page)
     if errores:
         return False, "El panel rechazo el formulario: " + " | ".join(errores[:3])
+
+    # Ni redireccion ni error. Antes se devolvia None y se reintentaba a ciegas.
+    # Ahora se PREGUNTA: si el jugador ya figura en el listado, el alta entro
+    # aunque el panel no lo haya dicho.
+    existe = existe_en_panel(page, str(reg.get("usuario", "")))
+    if existe is True:
+        return True, "sin redireccion, pero el jugador YA figura en el panel"
+    if existe is False:
+        return False, "sin señales y el jugador NO figura en el panel"
 
     return None, f"sin señales en pantalla ({detalle_modal or 'no se llego al modal'})"
 
