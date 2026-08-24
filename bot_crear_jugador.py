@@ -260,6 +260,15 @@ class ErrorConfig(Exception):
     """El .env no esta completo. No tiene sentido reintentar."""
 
 
+class ErrorApi(Exception):
+    """La API contesto, pero con un rechazo (no es un problema de red).
+
+    Se separa de requests.RequestException a proposito: una cosa es "no llego
+    el pedido" y otra muy distinta "llego y la API dijo que no". La segunda es
+    siempre configuracion -- clave que no coincide, dominio sin cliente, ruta
+    equivocada -- y el mensaje tiene que decirlo, no disfrazarse de caida."""
+
+
 def sesion_http(key: str) -> requests.Session:
     """Session con reintentos, para las dos colas.
 
@@ -311,7 +320,54 @@ class ApiJugadores:
         Para mirar sin tocar nada, usar ver()."""
         r = self.s.get(self.url, params={"accion": "pendientes", "limite": limite}, timeout=20)
         r.raise_for_status()
-        return r.json().get("datos", [])
+        try:
+            j = r.json()
+        except ValueError:
+            # HTML en vez de JSON = casi siempre el WAF o una pagina de error
+            # del hosting. Sin esto, .json() explota con un traceback ilegible.
+            raise ErrorApi(
+                f"La API no devolvio JSON (primeros 120 chars): {r.text[:120]!r}"
+            )
+        # 200 con ok:false. Pasaba desapercibido: .get('datos', []) devolvia
+        # lista vacia y el bot se quedaba "escuchando" contra una API que le
+        # estaba diciendo que no, sin una sola linea en el log.
+        if isinstance(j, dict) and j.get("ok") is False:
+            raise ErrorApi(f"La API rechazo el pedido: {j.get('error', 'sin detalle')}")
+        return j.get("datos", [])
+
+    def diagnostico(self) -> None:
+        """Loguea contra que cola esta hablando y que hay adentro.
+
+        Corre una sola vez al arrancar. No reclama nada (usa 'ver')."""
+        archivo = self.url.rsplit("/", 1)[-1].split("?")[0]
+        log.info("Cola de altas: %s", self.url)
+        if archivo != "altas_cola.php":
+            log.warning(
+                "  OJO: API_URL apunta a '%s', no a altas_cola.php. "
+                "Las altas viven en altas_cola.php; con otro archivo el bot "
+                "no va a ver nunca un pedido.", archivo
+            )
+        try:
+            d = self.ver(limite=5)
+        except ErrorApi as e:
+            log.error("  No pude leer la cola: %s", e)
+            return
+        except requests.RequestException as e:
+            log.error("  No pude leer la cola: %s", e)
+            return
+
+        r = d.get("resumen") or {}
+        log.info("  En la cola: %s pendiente(s) con clave, %s en proceso, "
+                 "%s con error, %s ya creadas",
+                 r.get("listos", 0), r.get("tomados", 0),
+                 r.get("con_error", 0), r.get("en_panel", 0))
+        if not r.get("total"):
+            log.warning(
+                "  La cola esta VACIA. Si acabas de pedir un alta por el chat "
+                "y no aparece, el chat esta escribiendo en OTRA base: la API "
+                "elige el cliente por el dominio del pedido, y este bot entra "
+                "por %s.", self.url.split("/")[2]
+            )
 
     def ver(self, limite: int = 20) -> dict:
         """Espia la cola sin reclamar nada."""
@@ -1037,10 +1093,21 @@ def main() -> int:
 
         log.info("Sesion OK en %s. Escuchando la base cada %ss...", PANEL_URL, poll)
 
+        # Foto de la cola al arrancar. Es el diagnostico que mas veces faltó:
+        # con el bot logueado y "escuchando", no habia forma de saber si la
+        # cola estaba vacia de verdad o si estaba mirando la cola equivocada
+        # (otro dominio => otro cliente => otra base). Ahora lo dice.
+        api.diagnostico()
+
         try:
             while True:
                 try:
                     lote = api.pendientes(args.lote)
+                except ErrorApi as e:
+                    # La API contesto, pero dijo que no. Es config, no red:
+                    # clave que no coincide, dominio sin cliente, ruta mal.
+                    log.error("%s", e)
+                    lote = []
                 except requests.RequestException as e:
                     log.error("API caida o inaccesible: %s", e)
                     lote = []
