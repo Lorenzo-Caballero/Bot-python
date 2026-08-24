@@ -800,6 +800,67 @@ def confirmar_modal(page, timeout_ms: int = 8_000, rx: re.Pattern = None) -> str
     return "sin modal"
 
 
+def esperar_salida_del_form(page, timeout_ms: int = 20_000) -> str:
+    """Espera a que el panel se vaya del formulario. Devuelve la URL, o "".
+
+    Cuando el alta sale bien, el panel navega al listado (/users/all). Esa es
+    la señal REAL de exito y llega en segundos.
+
+    El POST, en cambio, casi nunca se detecta: expect_response se come sus 30
+    segundos enteros y recien despues miramos la pantalla. Eso hacia que cada
+    alta -incluso las que salian bien- tardara medio minuto, y que un fallo
+    tardara lo mismo antes de poder reintentar.
+    """
+    limite = time.monotonic() + timeout_ms / 1000
+    base = PANEL_URL.rstrip("/")
+    while time.monotonic() < limite:
+        try:
+            url = page.url
+        except Exception:
+            url = ""
+        if url and base not in url.rstrip("/"):
+            return url
+        page.wait_for_timeout(300)
+    return ""
+
+
+def enviar_formulario(page, reg: dict) -> tuple[bool | None, str]:
+    """Aprieta crear, confirma el modal y espera una señal.
+
+    Devuelve (True|False|None, detalle). None = ni exito ni error reconocible;
+    el caller decide si reintenta.
+    """
+    detalle_modal = ""
+    try:
+        with page.expect_response(es_respuesta_de_creacion, timeout=12_000) as info:
+            page.click(primer_selector(page, SEL["btn_crear"]))
+            # El POST NO sale con ese click: primero hay que confirmar el modal.
+            # Va adentro del expect_response a proposito -- afuera, el bot
+            # esperaria una respuesta que todavia nadie disparo.
+            detalle_modal = confirmar_modal(page)
+            log.info("  %s", detalle_modal)
+        resp = info.value
+        if resp.ok:
+            return True, f"HTTP {resp.status} {resp.url}"
+        if 300 <= resp.status < 400:
+            return True, f"HTTP {resp.status} redirect a {resp.url}"
+        return False, f"HTTP {resp.status}"
+    except PWTimeout:
+        pass
+
+    # No se detecto el POST. La señal buena es que el panel se haya ido del
+    # formulario: cuando el alta entra, navega al listado.
+    url = esperar_salida_del_form(page)
+    if url:
+        return True, f"redirigio a {url} ({detalle_modal or 'sin modal'})"
+
+    errores = errores_de_validacion(page)
+    if errores:
+        return False, "El panel rechazo el formulario: " + " | ".join(errores[:3])
+
+    return None, f"sin señales en pantalla ({detalle_modal or 'no se llego al modal'})"
+
+
 # ---------------------------------------------------------------------------
 # Carga de un jugador
 # ---------------------------------------------------------------------------
@@ -826,91 +887,37 @@ def crear_jugador(page, reg: dict, dry_run: bool = False) -> tuple[bool, str]:
         log.info("[DRY-RUN] Formulario completo y valido, NO se envia")
         return True, "dry-run"
 
-    # Interceptamos la respuesta del POST: es mas confiable que buscar un toast
-    detalle_modal = ""
-    try:
-        with page.expect_response(es_respuesta_de_creacion, timeout=30_000) as info:
-            page.click(primer_selector(page, SEL["btn_crear"]))
-            # El POST NO sale con ese click: primero hay que confirmar el modal.
-            # Esto va adentro del expect_response a proposito. Afuera, el bot
-            # se quedaria esperando una respuesta que todavia nadie disparo,
-            # hasta que venza el timeout.
-            detalle_modal = confirmar_modal(page)
-            log.info("  %s", detalle_modal)
-        resp = info.value
-    except PWTimeout:
-        # Plan B: no reconocimos el POST, miramos la pantalla
-        ok, detalle = resultado_visual(page)
+    # Enviar. Si no hay ninguna señal -ni POST, ni redireccion, ni error en
+    # pantalla- se reintenta UNA vez: ese caso resulto ser intermitente (dos
+    # altas seguidas, la primera entro y la segunda no, con el mismo codigo y
+    # el mismo panel). Un reintento inmediato sale mas barato que dejarlo en
+    # error y que el jugador espere a que la cola lo tome de nuevo.
+    ok, detalle = enviar_formulario(page, reg)
+
+    if ok is None:
         page.screenshot(path=str(SHOTS / f"sin_respuesta_{reg['id']}.png"))
-        detalle = f"{detalle} ({detalle_modal or 'no se llego al modal'})"
-
-        # Si no salio ningun POST, lo mas comun es que el panel haya rechazado
-        # el formulario y ni lo haya enviado. El motivo esta en pantalla, al
-        # lado del campo: sin esto el log decia "no se detecto la respuesta del
-        # servidor", que manda a buscar el problema en la red cuando en
-        # realidad el panel te esta diciendo que el usuario es muy corto o que
-        # el correo ya existe.
-        errores = errores_de_validacion(page)
-        if errores:
-            motivo = " | ".join(errores[:3])
-            return False, f"El panel rechazo el formulario: {motivo}"
-
-        # Ni POST ni mensaje de error reconocible. Se vuelca el HTML del form
-        # para poder mirarlo despues: sin esto solo queda "no se detecto la
-        # respuesta", que no alcanza para saber si el boton quedo apagado, si
-        # hay un overlay tapando, o si el panel muestra el error de una forma
-        # que todavia no contemplamos.
         try:
             html = page.locator(primer_selector(page, FORM_SELS, 2_000)).first.inner_html(timeout=3_000)
-            destino = SHOTS / f"form_{reg['id']}.html"
-            destino.write_text(html, encoding="utf-8")
-            log.warning("  volque el HTML del form en %s", destino)
-        except Exception as e:
-            log.debug("no pude volcar el form: %s", e)
+            (SHOTS / f"form_{reg['id']}.html").write_text(html, encoding="utf-8")
+        except Exception:
+            pass
+
+        log.warning("  sin señal (%s). Reintento una vez.", detalle)
+        abrir_formulario(page)
+        for sel_key, dato_key in ORDEN:
+            tipear(page, SEL[sel_key], datos[dato_key])
+        if not esperar_boton_habilitado(page):
+            return False, "En el reintento el boton nunca se habilito"
+        ok, detalle = enviar_formulario(page, reg)
 
         if ok is None:
-            return False, f"No se detecto la respuesta del servidor tras enviar. {detalle}"
-        return ok, f"sin POST detectado, {detalle}"
+            # Sigue sin saberse. Se devuelve error para que la cola lo tome de
+            # nuevo (intentos < MAX_INTENTOS), y NO se da por creada la cuenta:
+            # de ahi salen credenciales que no abren nada.
+            return False, f"Sin señal tras reintentar: {detalle}"
 
-    if resp.ok:
-        return True, f"HTTP {resp.status} {resp.url}"
+    return ok, detalle
 
-    # 3xx NO es un fallo: despues de un POST, redirigir es la forma normal de
-    # decir "listo" (POST-Redirect-GET, para que un F5 no reenvie el alta). El
-    # panel lo usa, y como resp.ok solo acepta 2xx, el alta terminaba marcada
-    # como error aunque el jugador hubiera quedado creado.
-    #
-    # Encima un redirect no tiene cuerpo: resp.text() lanza
-    # "Response body is unavailable for redirect responses" y se llevaba
-    # puesta la vuelta entera del bot.
-    #
-    # No se asume que salio bien por ver un 3xx: se confirma mirando la
-    # pantalla, que es lo unico que dice si el jugador quedo creado.
-    if 300 <= resp.status < 400:
-        ok, detalle = resultado_visual(page)
-        if ok is None:
-            # Ni confirmado ni desmentido. Se devuelve error para que la cola
-            # lo reintente: mejor un reintento que se choca con "usuario ya
-            # existe" que dar por creada una cuenta que capaz no existe.
-            page.screenshot(path=str(SHOTS / f"redirect_{reg['id']}.png"))
-            return False, (f"HTTP {resp.status} redirigio a {resp.url} y no pude "
-                           f"confirmar en pantalla ({detalle})")
-        return ok, f"HTTP {resp.status} redirect - {detalle}"
-
-    detalle = ""
-    try:
-        detalle = json.dumps(resp.json(), ensure_ascii=False)[:300]
-    except Exception:
-        # .text() tambien puede fallar (cuerpo ya liberado, respuesta sin
-        # cuerpo). Que el bot no se caiga por no poder leer el detalle del
-        # error: el status y la URL ya dicen bastante.
-        try:
-            detalle = (resp.text() or "")[:300]
-        except Exception as e:
-            detalle = f"(sin cuerpo legible: {e})"
-
-    page.screenshot(path=str(SHOTS / f"rechazado_{reg['id']}.png"))
-    return False, f"HTTP {resp.status} - {detalle}"
 
 
 # ---------------------------------------------------------------------------
