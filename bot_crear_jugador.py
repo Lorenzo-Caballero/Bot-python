@@ -184,9 +184,14 @@ SEL = {
         "input[placeholder='Apellido']",
         ".create-player__fields > div:nth-child(6) input",
     ],
+    # OJO: el boton NO tiene type='submit'. En el panel es
+    #   div.create-player__bottom > button.button.button_sizable_low.button_colors_default
+    # y al lado tiene "CANCELAR", que es .button_colors_secondary o similar --
+    # por eso se filtra por button_colors_default y nunca por posicion.
     "btn_crear": [
+        f"{FORM} .create-player__bottom button.button_colors_default",
+        ".create-player__bottom button.button_colors_default",
         f"{FORM} button[type='submit']",
-        "form button[type='submit']",
         "button:has-text('CREAR JUGADOR')",
     ],
     "btn_cancel": [
@@ -855,29 +860,30 @@ def enviar_formulario(page, reg: dict) -> tuple[bool | None, str]:
     Devuelve (True|False|None, detalle). None = ni exito ni error reconocible;
     el caller decide si reintenta.
     """
-    detalle_modal = ""
-    try:
-        with page.expect_response(es_respuesta_de_creacion, timeout=12_000) as info:
-            page.click(primer_selector(page, SEL["btn_crear"]))
-            # El POST NO sale con ese click: primero hay que confirmar el modal.
-            # Va adentro del expect_response a proposito -- afuera, el bot
-            # esperaria una respuesta que todavia nadie disparo.
-            detalle_modal = confirmar_modal(page)
-            log.info("  %s", detalle_modal)
-        resp = info.value
-        if resp.ok:
-            return True, f"HTTP {resp.status} {resp.url}"
-        if 300 <= resp.status < 400:
-            return True, f"HTTP {resp.status} redirect a {resp.url}"
-        return False, f"HTTP {resp.status}"
-    except PWTimeout:
-        pass
+    # UN solo click, y despues mirar.
+    #
+    # Antes se clickeaba el boton y enseguida se llamaba a confirmar_modal(),
+    # dando por hecho que el panel pedia una confirmacion aparte. Pero el
+    # formulario de alta VIVE DENTRO del modal (#modal-root): confirmar_modal
+    # encontraba ESE MISMO boton "CREAR JUGADOR" y lo apretaba de nuevo. El
+    # segundo click caia sobre un boton que ya estaba procesando y el alta se
+    # quedaba a medio camino, con el form lleno en pantalla y sin POST.
+    page.click(primer_selector(page, SEL["btn_crear"]))
 
-    # No se detecto el POST. La señal buena es que el panel se haya ido del
-    # formulario: cuando el alta entra, navega al listado.
-    url = esperar_salida_del_form(page)
+    # Camino normal: el panel navega al listado. Se le da un rato corto antes
+    # de buscar cualquier confirmacion, porque casi siempre alcanza con esto.
+    url = esperar_salida_del_form(page, 8_000)
     if url:
-        return True, f"redirigio a {url} ({detalle_modal or 'sin modal'})"
+        return True, f"redirigio a {url}"
+
+    # Sigue en el form. AHORA si tiene sentido buscar un modal de confirmacion
+    # -- pero solo si trae un boton distinto del que ya apretamos.
+    detalle_modal = confirmar_modal(page)
+    if detalle_modal != "sin modal":
+        log.info("  %s", detalle_modal)
+        url = esperar_salida_del_form(page, 12_000)
+        if url:
+            return True, f"redirigio a {url} ({detalle_modal})"
 
     errores = errores_de_validacion(page)
     if errores:
