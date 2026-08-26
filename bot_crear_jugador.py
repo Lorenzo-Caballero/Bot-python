@@ -64,6 +64,8 @@ import sys
 import time
 from pathlib import Path
 
+from urllib.parse import urlparse
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -107,8 +109,26 @@ PANEL_URL = os.environ.get(
 # es_pantalla_login() busca el boton 'Acceder' en vez de mirar la URL.
 LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamos7.com/")
 
-# Host del panel: se usa para distinguir el POST real de la telemetria
-HOST_PANEL = "ganamos7.com"
+# Host del panel: se usa para distinguir el POST real de la telemetria.
+#
+# Sale de PANEL_URL y NO va hardcodeado. Estaba fijo en "ganamos7.com" mientras
+# esta cuenta opera contra agents.ganamosonline.com: ningun POST matcheaba, asi
+# que expect_response se comia su timeout ENTERO en cada alta y despues habia
+# que adivinar el resultado mirando la pantalla. Eran ~6 segundos regalados por
+# jugador, con el de enfrente esperando.
+def _host_de(url: str) -> str:
+    try:
+        h = urlparse(url).hostname or ""
+    except Exception:
+        return ""
+    # Se queda con el dominio registrable (agents.ganamosonline.com ->
+    # ganamosonline.com) para que matchee aunque el POST salga por otro
+    # subdominio, que es el caso normal en estos paneles.
+    partes = h.split(".")
+    return ".".join(partes[-2:]) if len(partes) >= 2 else h
+
+
+HOST_PANEL = _host_de(PANEL_URL) or "ganamos7.com"
 
 # Credenciales del panel de agentes. NUNCA hardcodear aca: van en el .env,
 # que esta en .gitignore. Si faltan, el bot cae al login manual (--login).
@@ -1407,7 +1427,11 @@ def main() -> int:
     # 10 s y no 30: del otro lado hay alguien mirando "creando tu cuenta". La
     # consulta es un GET a nuestra propia API, no al panel, asi que sondear mas
     # seguido no molesta a nadie. Se puede subir con POLL_SEGUNDOS en el .env.
-    poll = int(os.environ.get("POLL_SEGUNDOS", 10))
+    # 3 segundos. Es un GET a NUESTRA API (no al panel), asi que sondear
+    # seguido no le cuesta nada a nadie -- y del otro lado hay alguien mirando
+    # "creando tu cuenta". Con 10s se perdian 5 de promedio solo esperando que
+    # el bot mirara la cola.
+    poll = int(os.environ.get("POLL_SEGUNDOS", 3))
 
     with sync_playwright() as p:
         browser, ctx = nuevo_contexto(p, headless=args.headless, con_sesion=True)
@@ -1482,10 +1506,10 @@ def main() -> int:
                     # a todas las que vienen atras.
                     recuperar_pagina(page)
 
-                    # Pausa corta entre altas. Existe para no martillar el
-                    # panel, pero 2-4 s se sentian de mas cuando hay varias en
-                    # cola: el jugador ya esta esperando del otro lado.
-                    time.sleep(random.uniform(0.8, 1.5))
+                    # Pausa entre altas. Existe para no martillar el panel,
+                    # pero el que espera del otro lado no tiene la culpa: se
+                    # deja lo minimo para que el SPA termine de reacomodarse.
+                    time.sleep(random.uniform(0.3, 0.6))
 
                 # Cargas de saldo, en el MISMO navegador. Dos procesos con la
                 # misma cuenta de agente se pisan la sesion, asi que conviene
