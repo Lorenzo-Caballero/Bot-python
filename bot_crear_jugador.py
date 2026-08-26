@@ -578,8 +578,9 @@ def estado_campos(page) -> list[str]:
     El panel marca validez con clases input_validState_N. No documente que
     significa cada N, asi que reportamos el crudo en vez de adivinar.
     """
+    sel_form = primer_selector(page, FORM_SELS, 2_000)
     return page.eval_on_selector_all(
-        f"{FORM} input",
+        f"{sel_form} input",
         """els => els.map(e => {
             const st = [...e.classList].find(c => c.startsWith('input_validState_')) || 'sin-estado';
             return (e.placeholder || e.name) + '=' + st.replace('input_validState_', '');
@@ -750,6 +751,12 @@ def recuperar_pagina(page) -> None:
     #    intenta de nuevo por su cuenta.
     try:
         page.goto(PANEL_URL, wait_until="domcontentloaded", timeout=15_000)
+        # El login del panel vive en la raiz y responde 200: aterrizar ahi no
+        # falla nada por si solo. Se AVISA y listo -- el proximo alta pasa por
+        # abrir_formulario, que si detecta el login y dispara el re-login por
+        # el camino normal (SesionExpirada).
+        if es_pantalla_login(page):
+            log.warning("recuperar_pagina aterrizo en el LOGIN: la sesion se cayo")
     except Exception as e:
         log.debug("no pude recuperar la pagina: %s", e)
 
@@ -853,33 +860,13 @@ def confirmar_modal(page, timeout_ms: int = 8_000, rx: re.Pattern = None) -> str
     return "sin modal"
 
 
-def esperar_salida_del_form(page, timeout_ms: int = 20_000) -> str:
-    """Espera a que el panel se vaya del formulario. Devuelve la URL, o "".
-
-    Cuando el alta sale bien, el panel navega al listado (/users/all). Esa es
-    la señal REAL de exito y llega en segundos.
-
-    El POST, en cambio, casi nunca se detecta: expect_response se come sus 30
-    segundos enteros y recien despues miramos la pantalla. Eso hacia que cada
-    alta -incluso las que salian bien- tardara medio minuto, y que un fallo
-    tardara lo mismo antes de poder reintentar.
-    """
-    limite = time.monotonic() + timeout_ms / 1000
-    base = PANEL_URL.rstrip("/")
-    while time.monotonic() < limite:
-        try:
-            url = page.url
-        except Exception:
-            url = ""
-        if url and base not in url.rstrip("/"):
-            return url
-        page.wait_for_timeout(300)
-    return ""
-
-
 # Listado de jugadores del panel. Se deriva de PANEL_URL para no tener otra
 # URL suelta en el .env: .../user/create-player -> .../users/all
-URL_LISTADO = PANEL_URL.rsplit("/user/", 1)[0] + "/users/all"
+# Con el esquema+host y no con rsplit("/user/"): si el .env trae una ruta
+# distinta (p. ej. /users/create-player), el rsplit devolvia una URL rota EN
+# SILENCIO y existe_en_panel navegaba a cualquier lado.
+_pu = urlparse(PANEL_URL)
+URL_LISTADO = f"{_pu.scheme}://{_pu.netloc}/users/all"
 
 
 def existe_en_panel(page, usuario: str) -> bool | None:
@@ -920,84 +907,155 @@ def existe_en_panel(page, usuario: str) -> bool | None:
         caja.press_sequentially(usuario, delay=40)
         page.wait_for_timeout(400)
         btn = fichas.primero(page, fichas.SEL_APLICAR, 3_000)
-        if btn is not None:
-            btn.click(timeout=5_000)
+        if btn is None:
+            # SIN el boton de "Aplicar Filtro" tipear no filtra nada: el
+            # listado sigue mostrando la primera pagina de siempre, y un
+            # jugador recien creado no esta ahi. Afirmar "NO figura" en ese
+            # estado es un falso negativo que manda el alta a error, la cola
+            # la reintenta y el reintento choca con "usuario ya existe".
+            # No saber es no saber: None.
+            log.warning("  no encontre 'Aplicar Filtro' en el listado: "
+                        "no puedo confirmar ni descartar al jugador")
+            return None
+        btn.click(timeout=5_000)
         page.wait_for_timeout(1_500)
         texto = (page.locator("body").inner_text(timeout=5_000) or "")
     except Exception as e:
         log.debug("no pude buscar en el listado: %s", e)
         return None
 
-    # Comparacion laxa a proposito: el listado puede mostrarlo con otro
-    # formato, pero el nombre en si aparece igual.
-    return usuario.lower() in texto.lower()
+    # Palabra COMPLETA, no substring: 'ana' adentro de 'juana' daba falso
+    # positivo, y un falso positivo aca marca el alta como creada -- o sea
+    # credenciales entregadas para una cuenta que no existe, el peor error
+    # posible de este sistema. \b no alcanza porque el usuario puede empezar
+    # o terminar en . _ -, asi que el borde es "no letra/numero".
+    patron = r'(?<![a-zA-Z0-9])' + re.escape(usuario.lower()) + r'(?![a-zA-Z0-9])'
+    return re.search(patron, texto.lower()) is not None
 
 
 def enviar_formulario(page, reg: dict) -> tuple[bool | None, str]:
-    """Aprieta crear, confirma el modal y espera una señal.
+    """UN envio, espera paciente, y evidencia de red.
 
-    Devuelve (True|False|None, detalle). None = ni exito ni error reconocible;
-    el caller decide si reintenta.
+    Por que quedo asi (y no "tres formas de enviar" ni esperas de 6 segundos):
+
+    ESTE PANEL TARDA. En los logs reales, un alta exitosa tardo 30 segundos
+    entre confirmar el modal y navegar a /users/all (krillin, 12:01:11 ->
+    12:01:41). Las esperas "optimizadas" de 6-12s vencian ANTES de que el
+    panel terminara, y lo que venia despues empeoraba todo: se reenviaba el
+    formulario (segundo submit sobre uno en vuelo) y existe_en_panel()
+    navegaba a otra pagina, abortando el request del SPA a mitad de camino.
+    El alta no fallaba: LA MATABAMOS nosotros por impacientes.
+
+    Reglas de esta version:
+      - UN click en crear + UNA confirmacion del modal. Nunca un segundo
+        submit: la cola ya reintenta sola si de verdad fallo.
+      - Despues de confirmar NO SE NAVEGA a ningun lado hasta que el panel
+        conteste o venza una espera GENEROSA (45 s).
+      - Se escucha la RED: con HOST_PANEL correcto, la respuesta del POST de
+        creacion es la señal mas rapida y mas confiable. La redireccion a
+        /users/all es la segunda. Los errores de validacion en pantalla, la
+        tercera.
+      - Si no hubo ninguna señal, se loguea TODO el trafico POST que se vio:
+        la proxima corrida nos dice que hizo el panel en vez de adivinarlo.
     """
-    # Varias formas de enviar, en orden, hasta que una de una señal.
-    #
-    # Con una sola no alcanzaba: el boton no tiene type='submit', el form vive
-    # dentro del modal y clickearlo no siempre dispara el submit de React. En
-    # vez de adivinar cual anda, se prueban y se loguea la que funciono.
-    #
-    # OJO con confirmar_modal(): el form de alta VIVE dentro de #modal-root, asi
-    # que ahi encuentra ESE MISMO boton. Por eso se llama una sola vez y recien
-    # despues del primer intento, nunca en cada vuelta.
-    intentos = [
-        ("click en el boton",
-         lambda: page.click(primer_selector(page, SEL["btn_crear"]), timeout=8_000)),
-        ("click por texto",
-         lambda: page.get_by_role("button", name=RX_CONFIRMAR).first.click(timeout=8_000)),
-        ("Enter en el ultimo campo",
-         lambda: page.locator(primer_selector(page, SEL["apellido"])).first.press("Enter")),
-    ]
+    # --- oreja en la red, ANTES de tocar nada ---
+    capturas_red = []          # todos los POST al panel, para diagnostico
+    resultado_post = {}        # la respuesta del POST de creacion, si aparece
 
-    for como, accion in intentos:
+    def _oir(resp):
         try:
-            accion()
-        except (PWTimeout, PWError) as e:
-            log.debug("  %s no salio: %s", como, e)
-            continue
+            req = resp.request
+            if req.method != "POST":
+                return
+            url = resp.url.lower()
+            if HOST_PANEL not in url or any(r in url for r in HOSTS_RUIDO):
+                return
+            capturas_red.append(f"{resp.status} {resp.url[:120]}")
+            if es_respuesta_de_creacion(resp) and not resultado_post:
+                resultado_post["status"] = resp.status
+                resultado_post["url"] = resp.url
+        except Exception:
+            pass
 
-        url = esperar_salida_del_form(page, 6_000)
-        if url:
-            return True, f"redirigio a {url} [{como}]"
+    page.on("response", _oir)
+    try:
+        return _enviar_y_esperar(page, reg, capturas_red, resultado_post)
+    finally:
+        try:
+            page.remove_listener("response", _oir)
+        except Exception:
+            pass
 
-        # Puede haber una confirmacion aparte. Solo se prueba una vez.
-        if como == intentos[0][0]:
-            detalle_modal = confirmar_modal(page, timeout_ms=4_000)
-            if detalle_modal != "sin modal":
-                log.info("  %s", detalle_modal)
-                url = esperar_salida_del_form(page, 8_000)
-                if url:
-                    return True, f"redirigio a {url} ({detalle_modal})"
 
-        # Si el panel ya marco un error, no tiene sentido seguir probando.
-        if errores_de_validacion(page):
-            break
+def _enviar_y_esperar(page, reg, capturas_red, resultado_post):
+    """El cuerpo de enviar_formulario, separado para que el listener siempre
+    se cuelgue y se descuelgue en un solo lugar (el try/finally de arriba)."""
+    # --- UN click en crear ---
+    try:
+        page.click(primer_selector(page, SEL["btn_crear"]), timeout=10_000)
+    except (PWTimeout, PWError) as e:
+        return False, f"No pude clickear el boton de crear: {e}"
 
-    detalle_modal = ""
+    # --- UNA confirmacion, si el panel la pide ---
+    detalle_modal = confirmar_modal(page, timeout_ms=6_000)
+    if detalle_modal != "sin modal":
+        log.info("  %s", detalle_modal)
 
-    errores = errores_de_validacion(page)
-    if errores:
-        return False, "El panel rechazo el formulario: " + " | ".join(errores[:3])
+    # --- espera PACIENTE: una sola, generosa, sin tocar nada en el medio ---
+    limite = time.monotonic() + 45
+    base = PANEL_URL.rstrip("/")
+    aviso_30 = False
+    while time.monotonic() < limite:
+        # 1) La red contesto el POST de creacion: la señal mas confiable.
+        if resultado_post:
+            st = resultado_post["status"]
+            if 200 <= st < 400:
+                return True, f"HTTP {st} {resultado_post['url']}"
+            # 4xx/5xx: el panel lo rechazo. El motivo, si esta, en pantalla.
+            errores = errores_de_validacion(page)
+            det = (" | ".join(errores[:3])) if errores else f"HTTP {st}"
+            return False, f"El panel rechazo la creacion: {det}"
 
-    # Ni redireccion ni error. Antes se devolvia None y se reintentaba a ciegas.
-    # Ahora se PREGUNTA: si el jugador ya figura en el listado, el alta entro
-    # aunque el panel no lo haya dicho.
+        # 2) Navego fuera del formulario: creado.
+        try:
+            url = page.url
+        except Exception:
+            url = ""
+        if url and base not in url.rstrip("/"):
+            return True, f"redirigio a {url}"
+
+        # 3) Error de validacion visible: rechazado sin POST.
+        errores = errores_de_validacion(page)
+        if errores:
+            return False, "El panel rechazo el formulario: " + " | ".join(errores[:3])
+
+        if not aviso_30 and time.monotonic() > limite - 15:
+            aviso_30 = True
+            log.info("  el panel se esta tomando su tiempo (>30s), sigo esperando...")
+
+        page.wait_for_timeout(400)
+
+    # --- ni POST, ni redireccion, ni error: dejar EVIDENCIA y preguntar ---
+    try:
+        page.screenshot(path=str(SHOTS / f"sin_respuesta_{reg['id']}.png"))
+        html = page.locator(primer_selector(page, FORM_SELS, 2_000)).first.inner_html(timeout=3_000)
+        (SHOTS / f"form_{reg['id']}.html").write_text(html, encoding="utf-8")
+    except Exception:
+        pass
+    if capturas_red:
+        log.warning("  POSTs al panel durante la espera: %s", " ; ".join(capturas_red[:6]))
+    else:
+        log.warning("  NINGUN POST salio hacia el panel en 45s: el click no "
+                    "disparo el envio (boton equivocado o handler que no corrio)")
+
+    # Recien AHORA, vencida la espera, se puede navegar a mirar el listado:
+    # ya no hay ningun request nuestro que se pueda abortar.
     existe = existe_en_panel(page, str(reg.get("usuario", "")))
     if existe is True:
-        return True, "sin redireccion, pero el jugador YA figura en el panel"
+        return True, "sin señal directa, pero el jugador YA figura en el panel"
     if existe is False:
-        return False, "sin señales y el jugador NO figura en el panel"
-
-    return None, f"sin señales en pantalla ({detalle_modal or 'no se llego al modal'})"
-
+        return False, "sin señal y el jugador no aparece en el listado filtrado"
+    return None, f"sin señales tras 45s ({detalle_modal})"
 
 # ---------------------------------------------------------------------------
 # Carga de un jugador
@@ -1025,34 +1083,18 @@ def crear_jugador(page, reg: dict, dry_run: bool = False) -> tuple[bool, str]:
         log.info("[DRY-RUN] Formulario completo y valido, NO se envia")
         return True, "dry-run"
 
-    # Enviar. Si no hay ninguna señal -ni POST, ni redireccion, ni error en
-    # pantalla- se reintenta UNA vez: ese caso resulto ser intermitente (dos
-    # altas seguidas, la primera entro y la segunda no, con el mismo codigo y
-    # el mismo panel). Un reintento inmediato sale mas barato que dejarlo en
-    # error y que el jugador espere a que la cola lo tome de nuevo.
+    # UN solo envio por toma de la cola. El reintento inmediato que habia aca
+    # era parte del problema: con el panel todavia procesando el primer submit
+    # (tarda hasta 30s), el "reintento" recargaba el formulario y mandaba un
+    # SEGUNDO alta encima del primero. Si de verdad fallo, la cola lo vuelve a
+    # dar con backoff -- ese es el reintento correcto, con el panel ya en
+    # reposo.
     ok, detalle = enviar_formulario(page, reg)
 
     if ok is None:
-        page.screenshot(path=str(SHOTS / f"sin_respuesta_{reg['id']}.png"))
-        try:
-            html = page.locator(primer_selector(page, FORM_SELS, 2_000)).first.inner_html(timeout=3_000)
-            (SHOTS / f"form_{reg['id']}.html").write_text(html, encoding="utf-8")
-        except Exception:
-            pass
-
-        log.warning("  sin señal (%s). Reintento una vez.", detalle)
-        abrir_formulario(page)
-        for sel_key, dato_key in ORDEN:
-            tipear(page, SEL[sel_key], datos[dato_key])
-        if not esperar_boton_habilitado(page):
-            return False, "En el reintento el boton nunca se habilito"
-        ok, detalle = enviar_formulario(page, reg)
-
-        if ok is None:
-            # Sigue sin saberse. Se devuelve error para que la cola lo tome de
-            # nuevo (intentos < MAX_INTENTOS), y NO se da por creada la cuenta:
-            # de ahi salen credenciales que no abren nada.
-            return False, f"Sin señal tras reintentar: {detalle}"
+        # Sin señal tras la espera generosa. Error para que la cola reintente,
+        # y NUNCA por creada: de ahi salen credenciales que no abren nada.
+        return False, f"Sin señal: {detalle}"
 
     return ok, detalle
 
@@ -1424,13 +1466,9 @@ def main() -> int:
         log.error("%s", e)
         return 1
 
-    # 10 s y no 30: del otro lado hay alguien mirando "creando tu cuenta". La
-    # consulta es un GET a nuestra propia API, no al panel, asi que sondear mas
-    # seguido no molesta a nadie. Se puede subir con POLL_SEGUNDOS en el .env.
     # 3 segundos. Es un GET a NUESTRA API (no al panel), asi que sondear
     # seguido no le cuesta nada a nadie -- y del otro lado hay alguien mirando
-    # "creando tu cuenta". Con 10s se perdian 5 de promedio solo esperando que
-    # el bot mirara la cola.
+    # "creando tu cuenta". Se puede subir con POLL_SEGUNDOS en el .env.
     poll = int(os.environ.get("POLL_SEGUNDOS", 3))
 
     with sync_playwright() as p:
@@ -1456,6 +1494,7 @@ def main() -> int:
         api.diagnostico()
 
         ultimo_latido = time.monotonic()
+        dry_reclamados = []      # ids tomados en --dry-run, para devolverlos
         try:
             while True:
                 try:
@@ -1471,6 +1510,10 @@ def main() -> int:
 
                 if lote:
                     log.info("%d registro(s) pendiente(s)", len(lote))
+                    # Hubo trabajo: el latido de "cola vacia" se resetea, si
+                    # no imprimia "escuchando (cola vacia)" pegado a un lote
+                    # recien procesado y confundia mas de lo que aclaraba.
+                    ultimo_latido = time.monotonic()
 
                 for reg in lote:
                     etiqueta = f"{reg.get('id')} / {reg.get('usuario')}"
@@ -1482,8 +1525,21 @@ def main() -> int:
                         if not login_automatico(page):
                             log.error("No pude re-loguear. Corto para no perder registros.")
                             api.marcar(reg["id"], "error", "Sesion caida, sin re-login")
+                            # El resto del lote sigue reclamado en 'procesando':
+                            # sin esto quedaba colgado hasta el rescate de
+                            # zombies (15 min), con jugadores esperando.
+                            try:
+                                api.liberar()
+                            except Exception:
+                                pass
                             return 1
-                        guardar_sesion(ctx, page)
+                        try:
+                            guardar_sesion(ctx, page)
+                        except Exception as e:
+                            # Guardar la sesion es una comodidad (evita el
+                            # login del proximo arranque), no puede tumbar el
+                            # loop justo despues de recuperarlo.
+                            log.warning("no pude guardar la sesion: %s", e)
                         try:
                             ok, msg = crear_jugador(page, reg, args.dry_run)
                         except Exception as e:
@@ -1500,6 +1556,12 @@ def main() -> int:
 
                     if not args.dry_run:
                         api.marcar(reg["id"], "ok" if ok else "error", msg)
+                    else:
+                        # pendientes() RECLAMO este registro (lo paso a
+                        # 'procesando'). En dry-run nadie lo marca, asi que sin
+                        # esto cada pasada de prueba dejaba la cola envenenada
+                        # 15 minutos, hasta el rescate de zombies.
+                        dry_reclamados.append(reg["id"])
 
                     # Que el proximo alta arranque en un estado conocido. Sin
                     # esto, un fallo que deja el modal abierto se lleva puestas
@@ -1547,6 +1609,12 @@ def main() -> int:
         except KeyboardInterrupt:
             log.info("Cortado por el usuario")
         finally:
+            if dry_reclamados:
+                try:
+                    n = api.liberar()
+                    log.info("dry-run: devolvi %s registro(s) a la cola", n)
+                except Exception as e:
+                    log.warning("dry-run: no pude liberar la cola: %s", e)
             esperar_cierre(args.headless, args.mantener_abierto)
             browser.close()
 
