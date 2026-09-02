@@ -1,5 +1,5 @@
 """
-Bot de creacion automatica de jugadores en agents.ganamos7.com
+Bot de creacion automatica de jugadores en agents.ganamosonline.com
 
 Flujo:
     login.php -> tabla jugadores -> cola_panel.php -> este bot -> panel
@@ -37,10 +37,10 @@ Operacion:
     python bot_crear_jugador.py --headless       # sin ventana, para el server
 
 Archivo .env (esta en .gitignore, no subirlo):
-    API_URL=https://mi-dominio.com/api/jugadores.php
+    API_URL=https://ganamoscrm.online/gp-api/altas_cola.php
     API_KEY=una-clave-larga-y-random
-    PANEL_URL=https://agents.ganamos7.com/user/create-player
-    LOGIN_URL=https://agents.ganamos7.com/
+    PANEL_URL=https://agents.ganamosonline.com/user/create-player
+    LOGIN_URL=https://agents.ganamosonline.com/
     PANEL_USER=...
     PANEL_PASS=...
     POLL_SEGUNDOS=30
@@ -101,13 +101,13 @@ SHOTS.mkdir(parents=True, exist_ok=True)
 # DESTINO
 # ---------------------------------------------------------------------------
 PANEL_URL = os.environ.get(
-    "PANEL_URL", "https://agents.ganamos7.com/user/create-player"
+    "PANEL_URL", "https://agents.ganamosonline.com/user/create-player"
 )
 # La pantalla de login vive en la RAIZ, no en /login: el panel es un SPA y esa
 # ruta no existe (te deja en una pagina sin el campo de password, y el bot falla
 # con "No encontre los campos del login"). Mismo motivo por el que
 # es_pantalla_login() busca el boton 'Acceder' en vez de mirar la URL.
-LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamos7.com/")
+LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamosonline.com/")
 
 # Host del panel: se usa para distinguir el POST real de la telemetria.
 #
@@ -128,7 +128,10 @@ def _host_de(url: str) -> str:
     return ".".join(partes[-2:]) if len(partes) >= 2 else h
 
 
-HOST_PANEL = _host_de(PANEL_URL) or "ganamos7.com"
+# El fallback solo dispara si PANEL_URL viene vacio o no parsea; tiene que ser
+# el registrable del panel EN USO (agents.ganamosonline.com), porque si no el
+# unico caso en que se usa vuelve a mirar el panel que ya no operamos.
+HOST_PANEL = _host_de(PANEL_URL) or "ganamosonline.com"
 
 # Credenciales del panel de agentes. NUNCA hardcodear aca: van en el .env,
 # que esta en .gitignore. Si faltan, el bot cae al login manual (--login).

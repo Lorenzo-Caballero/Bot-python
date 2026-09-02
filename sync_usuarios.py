@@ -54,7 +54,13 @@ PAUSA_PAGINA = 0.4       # segundos entre paginas (gentil con el WAF)
 
 
 def url_guardado() -> str:
-    """De API_URL (.../api/cola_panel.php) sacamos .../api/usuarios_sync.php"""
+    """De API_URL (.../gp-api/altas_cola.php) sacamos .../gp-api/usuarios_sync.php
+
+    La rama "/api/" quedo del hosting viejo, donde la API colgaba de ahi. Con el
+    prefijo /gp-api/ del VPS no matchea (el guion corta la subcadena) y cae en el
+    rsplit generico, que reemplaza solo el nombre del archivo: igual da la ruta
+    buena, sea cual sea el prefijo.
+    """
     base = os.environ.get("API_URL", "")
     if "/api/" in base:
         return base.rsplit("/api/", 1)[0] + "/api/usuarios_sync.php"

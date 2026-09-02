@@ -1,6 +1,6 @@
 # ganamos-bot
 
-Bots de Playwright que operan el panel de agentes `agents.ganamos7.com`,
+Bots de Playwright que operan el panel de agentes `agents.ganamosonline.com`,
 empaquetados para correr en un VPS con Docker.
 
 | Servicio | Script | Qué hace |
@@ -67,7 +67,7 @@ nuevo. Mirá los logs del primer arranque antes de darlo por hecho.
 
 ---
 
-## La cola (hay que subirla a Hostinger antes de arrancar)
+## La cola (hay que subirla al server antes de arrancar)
 
 El bot no sale a buscar trabajo solo: lo pide por HTTP a la API propia. El
 endpoint viejo (`cola_panel.php`) consulta la tabla `jugadores`, que **la
@@ -83,10 +83,11 @@ El reemplazo ya está escrito y vive en el repo del proyecto, no en este:
 | Archivo | Dónde va |
 |---|---|
 | `api/sql/13_cola_altas.sql` | correr una vez en phpMyAdmin (crea la tabla `altas`) |
-| `api/altas_cola.php` | subir por FTP a `public_html/api/` |
+| `api/altas_cola.php` | copiar a `/var/www/api/` en el VPS (nginx lo sirve en `/gp-api/`) |
 
 El contrato HTTP es idéntico al viejo, así que **el bot no cambia**: solo apuntá
-`API_URL` a `.../api/altas_cola.php`.
+`API_URL` a `.../gp-api/altas_cola.php` (en el VPS la API se sirve bajo
+`/gp-api/`, no bajo `/api/`).
 
 Sin eso, el contenedor levanta, se loguea bien al panel y sondea cada 30s sin
 recibir nada nunca.
@@ -102,7 +103,7 @@ Encolar un alta de prueba (la password va en claro porque el bot la **tipea**
 en el formulario del panel; se borra sola cuando el alta se confirma):
 
 ```bash
-curl -X POST 'https://TU-DOMINIO/api/altas_cola.php?accion=encolar' \
+curl -X POST 'https://ganamoscrm.online/gp-api/altas_cola.php?accion=encolar' \
   -H 'X-API-Key: LA_MISMA_QUE_BOT_API_KEY' \
   -H 'Content-Type: application/json' \
   -H 'User-Agent: Mozilla/5.0' \
