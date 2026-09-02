@@ -47,7 +47,16 @@ load_dotenv()
 
 log = logging.getLogger("fichas")
 
-URL_USUARIOS = "https://agents.ganamos7.com/users/all"
+# El listado sale del MISMO lugar que el del alta (bot_crear_jugador, que a su
+# vez lo saca de PANEL_URL). Estaba hardcodeado en agents.ganamos7.com, y este
+# archivo corre DENTRO del proceso del alta (--con-fichas): con el .env
+# apuntando a otro panel, se creaba al jugador en uno y se lo buscaba en el
+# otro. Ahi sale el "No encontre al usuario 'X' en el panel" de alguien que
+# esta creado -- no esta en ESE panel.
+#
+# Los dos hosts existen y contestan, asi que el error no se ve venir: no falla
+# la navegacion, falla la busqueda.
+URL_USUARIOS = bot.URL_LISTADO
 
 # ---------------------------------------------------------------------------
 # Selectores del panel
@@ -989,7 +998,11 @@ def procesar_pendientes(page, api: ApiAcciones | None = None, limite: int = 10) 
     if not lote:
         return 0
 
-    log.info("%d accion(es) de saldo pendiente(s)", len(lote))
+    # El panel va en el log: cuando una accion falla con "no encontre al
+    # usuario", lo primero que hay que poder descartar es que estemos mirando
+    # el panel equivocado.
+    log.info("%d accion(es) de saldo pendiente(s) -- panel: %s",
+             len(lote), URL_USUARIOS)
 
     for acc in lote:
         etiqueta = f"{acc.get('id')} / {acc.get('usuario')} / {acc.get('tipo')} {acc.get('monto')}"

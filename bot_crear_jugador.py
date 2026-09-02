@@ -860,13 +860,30 @@ def confirmar_modal(page, timeout_ms: int = 8_000, rx: re.Pattern = None) -> str
     return "sin modal"
 
 
+# Raiz del panel (esquema + host), sin ninguna ruta. Es de donde salen TODAS
+# las demas URLs del panel, aca y en los scripts que importan este modulo
+# (bot_cargar_fichas, sync_usuarios, colector/ejecutar_cargas).
+#
+# Que sea una sola: agents.ganamos7.com y agents.ganamosonline.com son dos
+# instalaciones DISTINTAS de la misma plataforma -- distinto servidor, y la
+# sesion de una no vale en la otra (las dos contestan
+# {"error_message":"Unauthorized"} si se les pega sin login). Con la URL
+# hardcodeada en cada archivo, el alta puede crear al jugador en un panel
+# mientras las fichas lo buscan en el otro; el sintoma es "No encontre al
+# usuario 'X' en el panel" para alguien que existe.
+_pu = urlparse(PANEL_URL)
+PANEL_RAIZ = f"{_pu.scheme}://{_pu.netloc}"
+
 # Listado de jugadores del panel. Se deriva de PANEL_URL para no tener otra
 # URL suelta en el .env: .../user/create-player -> .../users/all
 # Con el esquema+host y no con rsplit("/user/"): si el .env trae una ruta
 # distinta (p. ej. /users/create-player), el rsplit devolvia una URL rota EN
 # SILENCIO y existe_en_panel navegaba a cualquier lado.
-_pu = urlparse(PANEL_URL)
-URL_LISTADO = f"{_pu.scheme}://{_pu.netloc}/users/all"
+URL_LISTADO = f"{PANEL_RAIZ}/users/all"
+
+# La API del panel, para lo que no necesita navegador (el deposito, el espejo
+# de usuarios). Mismo host que todo lo demas, por lo de arriba.
+PANEL_API = f"{PANEL_RAIZ}/api"
 
 
 def existe_en_panel(page, usuario: str) -> bool | None:

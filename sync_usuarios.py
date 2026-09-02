@@ -42,8 +42,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("sync")
 
-PANEL_API = "https://agents.ganamos7.com/api"
-USERS_URL = "https://agents.ganamos7.com/users/all"
+# Del MISMO lugar que el login (bot_crear_jugador -> PANEL_URL). Estaban
+# hardcodeadas en agents.ganamos7.com: si el .env apunta a otro panel, el
+# espejo terminaba copiando los jugadores de una instalacion distinta de
+# aquella donde el alta los crea, y `usuarios` quedaba sin ellos.
+PANEL_API = bot.PANEL_API
+USERS_URL = bot.URL_LISTADO
 POR_PAGINA = 50          # cuantos usuarios por pagina de la API
 LOTE_POST = 300          # cuantos mandamos por request a nuestro server
 PAUSA_PAGINA = 0.4       # segundos entre paginas (gentil con el WAF)
