@@ -101,7 +101,8 @@ SEL_ABRIR_FILTRO = [
 # buscando el bloque que contiene el nombre del jugador (ver saldo_en_deposito).
 SEL_SALDO_JUGADOR = []
 
-# La tabla no es <table>, son divs. Solo se mira la PRIMERA fila.
+# La tabla no es <table>, son divs. Estos apuntan a la PRIMERA fila y sirven
+# para saber si la tabla ya pinto algo (o si dice "sin resultados").
 SEL_FILA = [
     f"{_CONT} > div.users > div.users-table.users-table_tab_all > "
     "div.users-table__table > div.users-table__tbody > div:nth-child(1)",
@@ -110,6 +111,33 @@ SEL_FILA = [
     ".users-table__tbody > div",
     ".users-table-mobile__rows > div",
 ]
+
+# TODAS las filas, sin el `nth-child(1)`. Son los mismos selectores de arriba
+# con el ultimo escalon abierto.
+#
+# Existe por un error real: buscar() miraba solo la primera fila y, si el
+# jugador caia en la segunda, respondia "No encontre al usuario 'X' en el
+# panel" para alguien que estaba ahi a la vista. El filtro del panel no
+# devuelve una fila sola -- "fauno0800" trae tambien a "fauno08001" y
+# compania, y el orden no es el nuestro -- y si el filtro llega a no
+# aplicarse, abajo queda el listado entero.
+#
+# Ya estaba avisado en colector/SELECTORES-RETIRO.md: "div:nth-child(1) es la
+# primera fila. Hay que ubicar la fila del usuario correcto, no asumir que es
+# la primera."
+SEL_FILAS = [
+    f"{_CONT} > div.users > div.users-table.users-table_tab_all > "
+    "div.users-table__table > div.users-table__tbody > div",
+    f"{_CONT} > div > div.users-table-mobile.users-table-mobile_tab_all > "
+    "div.users-table-mobile__table > div.users-table-mobile__rows > div",
+    ".users-table__tbody > div",
+    ".users-table-mobile__rows > div",
+]
+
+# Cuantas filas se leen como maximo por vuelta. Con el filtro puesto son unas
+# pocas; el tope es para el caso en que el filtro no agarro y abajo hay una
+# pagina entera, donde leer 200 nombres tardaria mas que volver a filtrar.
+MAX_FILAS = 60
 
 # Mientras busca, el panel tapa la tabla con un overlay que dice "We are
 # looking for..". La tabla que se ve DEBAJO es todavia la de la busqueda
@@ -416,6 +444,28 @@ def saldo_en_deposito(page, usuario: str):
     return montos[0] if montos else None
 
 
+def filas_de(page, timeout_ms: int = 1_000) -> list:
+    """Todas las filas visibles de la tabla de usuarios, en orden.
+
+    Devuelve [] si la tabla todavia no pinto nada. Se queda con el PRIMER
+    selector que traiga filas: los de arriba son los del layout de escritorio
+    y los de abajo el respaldo generico, igual que primero().
+    """
+    limite = time.monotonic() + timeout_ms / 1000
+    while True:
+        for s in SEL_FILAS:
+            try:
+                loc = page.locator(s)
+                n = loc.count()
+                if n > 0 and loc.first.is_visible():
+                    return [loc.nth(i) for i in range(min(n, MAX_FILAS))]
+            except (PWTimeout, PWError):
+                pass
+        if time.monotonic() >= limite:
+            return []
+        page.wait_for_timeout(200)
+
+
 def nombre_de_fila(page, fila) -> str:
     """El nombre de usuario de una fila, sin la etiqueta PLAYER ni el saldo."""
     for sel in SEL_NOMBRE_EN_FILA:
@@ -474,13 +524,45 @@ def esperar_busqueda(page, timeout_s: float) -> bool:
     return False
 
 
+def sugerencia_exacta(page, objetivo: str, timeout_ms: int = 5_000):
+    """La opcion del desplegable que dice EXACTAMENTE `objetivo`. None si no esta.
+
+    `objetivo` ya viene en minusculas y sin espacios de sobra.
+    """
+    limite = time.monotonic() + timeout_ms / 1000
+    while True:
+        for s in SEL_SUGERENCIA:
+            try:
+                loc = page.locator(s)
+                n = loc.count()
+                if n == 0 or not loc.first.is_visible():
+                    continue
+                for i in range(min(n, MAX_FILAS)):
+                    op = loc.nth(i)
+                    txt = (op.inner_text(timeout=2_000) or "").strip().lower()
+                    if txt == objetivo:
+                        return op
+                # El desplegable esta y ninguna opcion es la nuestra: no tiene
+                # sentido esperar mas, ya resolvio.
+                return None
+            except (PWTimeout, PWError):
+                pass
+        if time.monotonic() >= limite:
+            return None
+        page.wait_for_timeout(200)
+
+
 def buscar(page, usuario: str, timeout_s: float = 45.0):
     """Filtra por `usuario` y devuelve la fila SOLO si es EXACTAMENTE ese.
 
     El match exacto evita el peor error posible: buscar 'fauno2' trae tambien
-    'fauno232' y 'fauno2999', y la primera fila puede ser cualquiera de los
-    tres. Depositar en el que no es no se deshace.
+    'fauno232' y 'fauno2999', y la fila que toque primero puede ser cualquiera
+    de los tres. Depositar en el que no es no se deshace.
+
+    Lo que NO hace (y antes si): rendirse porque la primera fila no era la
+    nuestra. Se recorre la tabla entera.
     """
+    objetivo = usuario.strip().lower()
     caja = primero(page, SEL_BUSCAR, 15_000)
     if caja is None:
         log.warning("  no encontre el buscador de usuarios en el panel")
@@ -502,7 +584,9 @@ def buscar(page, usuario: str, timeout_s: float = 45.0):
         caja.click(timeout=10_000)
     caja.fill("")
     # El panel aclara "introducir texto solo en minusculas" al lado del campo.
-    caja.type(usuario.lower(), delay=50)
+    # Va `objetivo` y no `usuario`: un espacio de mas al final (que en la base
+    # no se ve) filtraba por un texto que no existe y no traia ninguna fila.
+    caja.type(objetivo, delay=50)
 
     # El desplegable de coincidencias sale primero en blanco, con el overlay
     # "We are looking for.." adentro: si se lo mira ahi, no hay ninguna opcion
@@ -511,7 +595,15 @@ def buscar(page, usuario: str, timeout_s: float = 45.0):
 
     # Si aparece el desplegable de coincidencias, elegir la opcion ya deja el
     # filtro puesto y ahorra el paso siguiente.
-    sug = primero(page, SEL_SUGERENCIA, 5_000)
+    #
+    # PERO se clickea SOLO si la sugerencia es exactamente el que buscamos.
+    # Antes se apretaba la primera a ciegas, y la primera no tiene por que ser
+    # la nuestra: tipeando "fauno0800" el panel ofrece tambien "fauno08001" y
+    # demas. Clickear la que no es deja el filtro puesto en OTRO jugador, la
+    # tabla queda sin nuestra fila y el bot concluye "no existe" -- que es el
+    # error que estamos arreglando. Si ninguna coincide, no se toca nada y se
+    # filtra con el texto tipeado, que es lo correcto.
+    sug = sugerencia_exacta(page, objetivo)
     if sug is not None:
         try:
             sug.click(timeout=4_000)
@@ -538,7 +630,7 @@ def buscar(page, usuario: str, timeout_s: float = 45.0):
     esperar_busqueda(page, timeout_s)
 
     limite = time.monotonic() + timeout_s
-    visto = ""
+    vistos: list[str] = []
     vacias = 0          # veces seguidas que la tabla dijo "no hay resultados"
 
     while time.monotonic() < limite:
@@ -548,18 +640,31 @@ def buscar(page, usuario: str, timeout_s: float = 45.0):
             page.wait_for_timeout(250)
             continue
 
-        fila = primero(page, SEL_FILA, 1_000)
-        if fila is not None:
-            visto = nombre_de_fila(page, fila)
-            if visto.lower() == usuario.lower():
-                return fila
+        # TODAS las filas, no solo la primera: el filtro del panel devuelve
+        # varias y la nuestra puede no estar arriba. El match sigue siendo
+        # EXACTO -- eso es lo que evita depositarle a 'fauno232' cuando el
+        # pedido era de 'fauno2', y no se toca.
+        filas = filas_de(page, 1_000)
+        if filas:
+            vistos = []
+            for f in filas:
+                nombre = nombre_de_fila(page, f)
+                vistos.append(nombre)
+                if nombre.strip().lower() == objetivo:
+                    if len(vistos) > 1:
+                        # Vale la pena en el log: es la prueba de que el
+                        # jugador estaba en la tabla pero no primero.
+                        log.info("  '%s' estaba en la fila %d de %d",
+                                 usuario, len(vistos), len(filas))
+                    return f
 
             # Con la busqueda YA terminada, "no se encontraron resultados"
             # empieza a ser una respuesta y no un estado intermedio. Se pide
             # tres veces seguidas (~1s) por si es el parpadeo del repintado:
             # sin eso volveriamos a creerle a la tabla demasiado pronto, que es
             # el bug que estamos arreglando.
-            if any(t in visto.lower() for t in TXT_SIN_RESULTADOS):
+            texto = " | ".join(vistos).lower()
+            if any(t in texto for t in TXT_SIN_RESULTADOS):
                 vacias += 1
                 if vacias >= 3:
                     log.warning("  el panel dice que '%s' no existe", usuario)
@@ -569,7 +674,8 @@ def buscar(page, usuario: str, timeout_s: float = 45.0):
 
         page.wait_for_timeout(300)
 
-    log.warning("  la primera fila quedo en '%s', no en '%s'", visto or "(vacia)", usuario)
+    log.warning("  '%s' no esta en las %d fila(s) de la tabla: %s",
+                usuario, len(vistos), ", ".join(vistos[:10]) or "(vacia)")
     # Sin esto hay que adivinar si fallo el filtro, la busqueda o el layout.
     try:
         page.screenshot(path=str(bot.SHOTS / f"fichas_sin_fila_{usuario}.png"))
