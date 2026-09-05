@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
  && playwright install --with-deps chromium \
  && rm -rf /var/lib/apt/lists/*
 
-COPY bot_crear_jugador.py bot_cargar_fichas.py sync_usuarios.py ./
+COPY bot_crear_jugador.py bot_cargar_fichas.py sync_usuarios.py alta_api.py ./
 
 # El codigo escribe con rutas RELATIVAS al directorio actual: estado_sesion.json,
 # estado_session_storage.json, bot.log y capturas/. Por eso el WORKDIR de

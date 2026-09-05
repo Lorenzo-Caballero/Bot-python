@@ -96,6 +96,37 @@ SESSION_STORAGE_FILE = Path("estado_session_storage.json")
 SHOTS = Path("/datos/capturas") if Path("/datos").is_dir() else Path("capturas")
 SHOTS.mkdir(parents=True, exist_ok=True)
 
+# Plantilla del POST de creacion, aprendida del formulario (ver alta_api). Va en
+# el volumen montado (/datos) para sobrevivir a --force-recreate: aprenderla de
+# nuevo cuesta un alta lenta, y no hace falta pagarla en cada deploy.
+PLANTILLA_FILE = (SHOTS.parent / "alta_endpoint.json")
+
+# El fast-path (crear por API dentro del navegador, en paralelo) esta prendido
+# por defecto. ALTA_FAST=0 en el .env lo apaga y todo vuelve al formulario.
+FAST_ON = os.environ.get("ALTA_FAST", "1").strip() not in ("0", "false", "no", "")
+
+
+def cargar_plantilla() -> dict | None:
+    """La plantilla aprendida, si existe y parece completa."""
+    try:
+        d = json.loads(PLANTILLA_FILE.read_text(encoding="utf-8"))
+        if isinstance(d, dict) and d.get("url") and d.get("cuerpo"):
+            return d
+    except Exception:
+        pass
+    return None
+
+
+def guardar_plantilla(pl: dict) -> None:
+    """Persistir la plantilla aprendida. Best-effort: no poder guardarla solo
+    significa re-aprenderla el proximo arranque, no un alta perdida."""
+    try:
+        PLANTILLA_FILE.write_text(json.dumps(pl, ensure_ascii=False, indent=2),
+                                  encoding="utf-8")
+        log.info("Plantilla del fast-path guardada en %s", PLANTILLA_FILE)
+    except Exception as e:
+        log.warning("no pude guardar la plantilla del fast-path: %s", e)
+
 
 # ---------------------------------------------------------------------------
 # DESTINO
@@ -953,7 +984,7 @@ def existe_en_panel(page, usuario: str) -> bool | None:
     return re.search(patron, texto.lower()) is not None
 
 
-def enviar_formulario(page, reg: dict) -> tuple[bool | None, str]:
+def enviar_formulario(page, reg: dict, captura_out: dict | None = None) -> tuple[bool | None, str]:
     """UN envio, espera paciente, y evidencia de red.
 
     Por que quedo asi (y no "tres formas de enviar" ni esperas de 6 segundos):
@@ -994,12 +1025,30 @@ def enviar_formulario(page, reg: dict) -> tuple[bool | None, str]:
             if es_respuesta_de_creacion(resp) and not resultado_post:
                 resultado_post["status"] = resp.status
                 resultado_post["url"] = resp.url
+                # El cuerpo y el content-type del REQUEST, para aprender la
+                # plantilla del fast-path (alta_api). Best-effort: si no se
+                # puede leer, el formulario sigue funcionando igual, solo que
+                # sin poder acelerar las proximas altas.
+                try:
+                    resultado_post["req_body"] = resp.request.post_data or ""
+                    resultado_post["req_ct"] = (
+                        resp.request.headers.get("content-type", ""))
+                    resultado_post["req_method"] = resp.request.method
+                except Exception:
+                    pass
         except Exception:
             pass
 
     page.on("response", _oir)
     try:
-        return _enviar_y_esperar(page, reg, capturas_red, resultado_post)
+        res = _enviar_y_esperar(page, reg, capturas_red, resultado_post)
+        # Le pasamos al que llama lo que capturamos del POST real: con eso
+        # aprende la plantilla del fast-path. Se copia SIEMPRE (aunque el alta
+        # haya fallado): un 4xx igual trae la url y el cuerpo, que es lo que
+        # hace falta para armar la plantilla.
+        if captura_out is not None:
+            captura_out.update(resultado_post)
+        return res
     finally:
         try:
             page.remove_listener("response", _oir)
@@ -1080,7 +1129,8 @@ def _enviar_y_esperar(page, reg, capturas_red, resultado_post):
 # ---------------------------------------------------------------------------
 # Carga de un jugador
 # ---------------------------------------------------------------------------
-def crear_jugador(page, reg: dict, dry_run: bool = False) -> tuple[bool, str]:
+def crear_jugador(page, reg: dict, dry_run: bool = False,
+                  aprender: dict | None = None) -> tuple[bool, str]:
     datos = completar_datos(reg)
     log.info("  datos -> email=%s nombre=%s %s",
              datos["email"], datos["nombre"], datos["apellido"])
@@ -1109,7 +1159,30 @@ def crear_jugador(page, reg: dict, dry_run: bool = False) -> tuple[bool, str]:
     # SEGUNDO alta encima del primero. Si de verdad fallo, la cola lo vuelve a
     # dar con backoff -- ese es el reintento correcto, con el panel ya en
     # reposo.
-    ok, detalle = enviar_formulario(page, reg)
+    captura: dict = {}
+    ok, detalle = enviar_formulario(page, reg, captura)
+
+    # APRENDER la plantilla del fast-path. Solo con un alta que salio BIEN por
+    # formulario: eso prueba que el cuerpo capturado es el que el panel acepta.
+    # Se le pasan los valores EXACTOS que se tiparon (datos) para que alta_api
+    # los reemplace por marcadores. Best-effort: aprender no puede tumbar un
+    # alta que ya salio.
+    if ok is True and aprender is not None and captura.get("req_body"):
+        try:
+            import alta_api
+            pl = alta_api.construir_plantilla(
+                captura.get("url", ""),
+                captura.get("req_method", "POST"),
+                captura.get("req_ct", ""),
+                captura.get("req_body", ""),
+                {"usuario": datos["usuario"], "password": datos["password"],
+                 "email": datos["email"], "nombre": datos["nombre"],
+                 "apellido": datos["apellido"]},
+            )
+            if pl:
+                aprender.update(pl)
+        except Exception as e:
+            log.debug("no pude aprender la plantilla del fast-path: %s", e)
 
     if ok is None:
         # Sin señal tras la espera generosa. Error para que la cola reintente,
@@ -1117,6 +1190,97 @@ def crear_jugador(page, reg: dict, dry_run: bool = False) -> tuple[bool, str]:
         return False, f"Sin señal: {detalle}"
 
     return ok, detalle
+
+
+# JS que dispara TODOS los altas del lote a la vez con Promise.all, DENTRO del
+# navegador ya logueado. Se hace aca y no con requests por tres motivos que se
+# cubren de una: es el mismo Chrome real que ya pasa el WAF/Cloudflare del
+# panel; manda la cookie de sesion sola (credentials:'include'); y es mismo
+# origen, asi que no hay CORS. Devuelve un status+texto por item, que Python
+# despues juzga con alta_api.evaluar_respuesta.
+_JS_LOTE = """
+async (items) => {
+  const out = [];
+  await Promise.all(items.map(async (it) => {
+    try {
+      const r = await fetch(it.url, {
+        method: it.method || 'POST',
+        headers: { 'content-type': it.content_type || 'application/json' },
+        body: it.body,
+        credentials: 'include',
+      });
+      let t = '';
+      try { t = await r.text(); } catch (e) {}
+      out.push({ i: it.i, status: r.status, text: (t || '').slice(0, 600) });
+    } catch (e) {
+      // status 0 = ni siquiera salio (red, CORS, lo que sea): Python lo trata
+      // como 'no se sabe' y lo manda al formulario.
+      out.push({ i: it.i, status: 0, text: String(e).slice(0, 200) });
+    }
+  }));
+  return out;
+}
+"""
+
+
+def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
+    """Crea VARIOS jugadores a la vez por la API, desde el navegador.
+
+    Devuelve {id_reg: (resultado, msg)} donde resultado es True (creado),
+    False (nombre ya existe: al formulario, que renombra) o None (no se sabe:
+    al formulario, que verifica).
+
+    NO marca nada ni toca la cola: solo intenta y reporta. La decision de que
+    hacer con cada resultado la toma el loop, que es el que tiene la cola.
+    """
+    import alta_api
+
+    items = []
+    porid = {}
+    salida = {}
+    for idx, reg in enumerate(regs):
+        try:
+            datos = completar_datos(reg)
+            # El fast-path manda EXACTAMENTE lo mismo que tiparia el formulario.
+            cuerpo = alta_api.render_cuerpo(plantilla, {
+                "usuario": datos["usuario"], "password": datos["password"],
+                "email": datos["email"], "nombre": datos["nombre"],
+                "apellido": datos["apellido"],
+            })
+        except Exception as e:
+            # Un reg que no se puede armar cae al formulario, no rompe el lote.
+            salida[reg["id"]] = (None, f"no pude armar el cuerpo: {e}")
+            continue
+        items.append({
+            "i": idx,
+            "url": plantilla["url"],
+            "method": plantilla.get("metodo", "POST"),
+            "content_type": plantilla.get("content_type", "application/json"),
+            "body": cuerpo,
+        })
+        porid[idx] = reg
+
+    if not items:
+        return salida
+
+    try:
+        respuestas = page.evaluate(_JS_LOTE, items)
+    except Exception as e:
+        # Si el evaluate entero falla (pagina navegando, sesion caida), NO se
+        # da nada por creado: todos caen al formulario.
+        log.warning("  fast-path: el lote por fetch fallo entero (%s); al formulario", e)
+        return {reg["id"]: (None, f"fetch fallo: {e}") for reg in regs}
+
+    for r in respuestas or []:
+        reg = porid.get(r.get("i"))
+        if reg is None:
+            continue
+        res, msg = alta_api.evaluar_respuesta(int(r.get("status", 0)), r.get("text", ""))
+        salida[reg["id"]] = (res, msg)
+    # Cualquier item sin respuesta (no deberia pasar) -> al formulario.
+    for reg in regs:
+        salida.setdefault(reg["id"], (None, "sin respuesta del fetch"))
+    return salida
 
 
 
@@ -1513,8 +1677,21 @@ def main() -> int:
         # (otro dominio => otro cliente => otra base). Ahora lo dice.
         api.diagnostico()
 
+        # Fast-path: crear por API en paralelo. Con plantilla aprendida, un
+        # lote entero sale en ~1s; sin ella, la primera alta la aprende del
+        # formulario y a partir de la segunda vuela.
+        plantilla = cargar_plantilla() if FAST_ON else None
+        if not FAST_ON:
+            log.info("Fast-path APAGADO (ALTA_FAST=0): todo por formulario.")
+        elif plantilla:
+            log.info("Fast-path ON: creo por API en paralelo (plantilla ya aprendida).")
+        else:
+            log.info("Fast-path ON: sin plantilla todavia; la aprendo del primer "
+                     "alta por formulario.")
+
         ultimo_latido = time.monotonic()
         dry_reclamados = []      # ids tomados en --dry-run, para devolverlos
+        aprendido: dict = {}     # se llena cuando el formulario ensena la plantilla
         try:
             while True:
                 try:
@@ -1535,11 +1712,38 @@ def main() -> int:
                     # recien procesado y confundia mas de lo que aclaraba.
                     ultimo_latido = time.monotonic()
 
+                # --- FAST-PATH: el lote entero por API, en paralelo ---
+                # Lo que se crea por aca sale de `lote`; lo que quede (nombre
+                # ya existente => hay que renombrar, o respuesta dudosa) baja al
+                # formulario de abajo, que renombra y/o verifica. Un fallo del
+                # fast-path NUNCA da un alta por creada sin señal 2xx clara.
+                # En --dry-run NO se dispara: el fetch crearia cuentas de verdad.
+                # Ahi todo baja al formulario, que si respeta dry_run.
+                if plantilla and lote and not args.dry_run:
+                    resultados = crear_lote_por_fetch(page, plantilla, lote)
+                    restantes = []
+                    creados = 0
+                    for reg in lote:
+                        res, msg = resultados.get(reg["id"], (None, "sin respuesta"))
+                        if res is True:
+                            creados += 1
+                            log.info("  OK (API) %s / %s -> %s",
+                                     reg.get("id"), reg.get("usuario"), msg)
+                            api.marcar(reg["id"], "ok", "creado por API: " + msg)
+                        else:
+                            # False (renombrar) o None (verificar): al formulario.
+                            restantes.append(reg)
+                    if creados:
+                        log.info("  fast-path: %d/%d creado(s) por API; %d al formulario",
+                                 creados, len(lote), len(restantes))
+                    lote = restantes
+
                 for reg in lote:
                     etiqueta = f"{reg.get('id')} / {reg.get('usuario')}"
                     log.info("Creando jugador %s", etiqueta)
                     try:
-                        ok, msg = crear_jugador(page, reg, args.dry_run)
+                        ok, msg = crear_jugador(page, reg, args.dry_run,
+                                        aprender=(aprendido if plantilla is None else None))
                     except SesionExpirada:
                         log.warning("Sesion caida, reintentando login...")
                         if not login_automatico(page):
@@ -1561,7 +1765,8 @@ def main() -> int:
                             # loop justo despues de recuperarlo.
                             log.warning("no pude guardar la sesion: %s", e)
                         try:
-                            ok, msg = crear_jugador(page, reg, args.dry_run)
+                            ok, msg = crear_jugador(page, reg, args.dry_run,
+                                        aprender=(aprendido if plantilla is None else None))
                         except Exception as e:
                             log.exception("Excepcion tras re-login en %s", etiqueta)
                             ok, msg = False, f"Excepcion: {e}"
@@ -1573,6 +1778,16 @@ def main() -> int:
                         log.info("  OK  -> %s", msg)
                     else:
                         log.warning("  FALLO -> %s", msg)
+
+                    # Recien se aprendio la plantilla del fast-path: activarla
+                    # YA, para que el resto de ESTE lote (y los que vengan)
+                    # salgan por API. Se persiste para no re-aprenderla en el
+                    # proximo arranque.
+                    if plantilla is None and aprendido.get("url") and aprendido.get("cuerpo"):
+                        plantilla = dict(aprendido)
+                        guardar_plantilla(plantilla)
+                        log.info("Fast-path: plantilla aprendida; las proximas "
+                                 "altas van por API en paralelo.")
 
                     if not args.dry_run:
                         api.marcar(reg["id"], "ok" if ok else "error", msg)
