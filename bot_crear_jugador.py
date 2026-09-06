@@ -1365,7 +1365,18 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
         reg = porid.get(r.get("i"))
         if reg is None:
             continue
-        res, msg = alta_api.evaluar_respuesta(int(r.get("status", 0)), r.get("text", ""))
+        st = int(r.get("status", 0))
+        txt = r.get("text", "")
+        res, msg = alta_api.evaluar_respuesta(st, txt)
+        # El status y el cuerpo CRUDOS del panel, siempre. Es la unica forma de
+        # entender por que el fast-path juzga 'creado' / 'renombrar' / 'dudoso'
+        # sin adivinar: si cae al formulario cada vez (alta lenta), aca esta el
+        # motivo exacto -- que devuelve realmente el POST de creacion.
+        veredicto = ("creado" if res is True else
+                     "renombrar" if res is False else "al formulario")
+        log.info("  fast-path %s / %s: HTTP %s -> %s | cuerpo: %s",
+                 reg.get("id"), reg.get("usuario"), st, veredicto,
+                 (txt or "").replace("\n", " ")[:200])
         salida[reg["id"]] = (res, msg)
     # Cualquier item sin respuesta (no deberia pasar) -> al formulario.
     for reg in regs:
