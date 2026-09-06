@@ -22,6 +22,13 @@ RUN pip install --no-cache-dir -r requirements.txt \
 
 COPY bot_crear_jugador.py bot_cargar_fichas.py sync_usuarios.py alta_api.py ./
 
+# La version del codigo horneada EN la imagen. El bot la anuncia al arrancar:
+# es la unica defensa contra el fallo silencioso que ya paso dos veces --
+# recrear el contenedor sin --build y quedarse debuggeando codigo que no es el
+# que corre. La pasan deploy-bot.sh / arreglar-bot-altas.sh con --build-arg.
+ARG GIT_HASH=desconocido
+ENV BOT_VERSION=$GIT_HASH
+
 # El codigo escribe con rutas RELATIVAS al directorio actual: estado_sesion.json,
 # estado_session_storage.json, bot.log y capturas/. Por eso el WORKDIR de
 # ejecucion es /datos (el volumen) y NO /app: asi todo lo que se escribe cae en

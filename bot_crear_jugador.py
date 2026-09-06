@@ -1759,6 +1759,12 @@ def main() -> int:
                 return 1
             guardar_sesion(ctx, page)
 
+        # La version SIEMPRE en el log de arranque. "desconocido" tambien es
+        # informacion: la imagen se construyo sin pasar por deploy-bot.sh (o
+        # con un compose viejo), y no hay forma de saber que codigo corre.
+        log.info("Version del bot: %s. Si no coincide con `git log --oneline -1` "
+                 "del repo, la imagen esta VIEJA: corre scripts/deploy-bot.sh.",
+                 os.environ.get("BOT_VERSION", "desconocido"))
         log.info("Sesion OK en %s. Escuchando la base cada %ss...", PANEL_URL, poll)
 
         # Foto de la cola al arrancar. Es el diagnostico que mas veces faltó:

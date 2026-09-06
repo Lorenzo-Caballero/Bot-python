@@ -8,7 +8,12 @@ services:
   #
   # Las cargas NO depositan hasta que pongas FICHAS_MODE=LIVE en el .env.
   creador:
-    build: .
+    build:
+      context: .
+      args:
+        # scripts/deploy-bot.sh exporta GIT_HASH=$(git rev-parse --short HEAD)
+        # antes del build; sin exportar queda "desconocido" y el bot lo dice.
+        GIT_HASH: "${GIT_HASH:-desconocido}"
     image: ganamos-bot:latest
     container_name: ganamos-bot-creador
     restart: unless-stopped
@@ -36,7 +41,10 @@ services:
   # entrar de nuevo, van a estar pateandose el login entre los dos. Probalo
   # antes de dejar los dos prendidos.
   sync:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_HASH: "${GIT_HASH:-desconocido}"
     image: ganamos-bot:latest
     container_name: ganamos-bot-sync
     restart: unless-stopped
