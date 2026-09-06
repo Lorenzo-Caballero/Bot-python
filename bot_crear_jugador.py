@@ -106,6 +106,41 @@ PLANTILLA_FILE = (SHOTS.parent / "alta_endpoint.json")
 FAST_ON = os.environ.get("ALTA_FAST", "1").strip().lower() not in (
     "0", "false", "no", "off", "")
 
+# Cuantos fetch de creacion en paralelo tolera el panel sin cortar sesiones.
+# El fast-path toma un lote grande y lo dispara en OLAS de este tamaño (ver
+# _JS_LOTE): 6 es un punto seguro para un panel que ya corta conexiones solo.
+# Subilo con ALTA_CONCURRENCIA si el panel aguanta; bajalo si ves socket hang
+# up bajo carga.
+try:
+    ALTA_CONCURRENCIA = max(1, int(os.environ.get("ALTA_CONCURRENCIA", "6")))
+except ValueError:
+    ALTA_CONCURRENCIA = 6
+
+# Timeout por fetch (ms) y techo de tiempo del lote entero. El page.evaluate
+# que dispara el pool es BLOQUEANTE y Playwright no le pone timeout: si el
+# panel deja sockets colgados, sin estos topes el loop de altas se congela
+# minutos. 15s por item + un deadline total acotan cuanto puede tardar el
+# lote antes de devolver lo que se pudo y seguir.
+try:
+    ALTA_FETCH_TIMEOUT_MS = max(3000, int(os.environ.get("ALTA_FETCH_TIMEOUT_MS", "15000")))
+except ValueError:
+    ALTA_FETCH_TIMEOUT_MS = 15000
+try:
+    ALTA_LOTE_DEADLINE_MS = max(5000, int(os.environ.get("ALTA_LOTE_DEADLINE_MS", "40000")))
+except ValueError:
+    ALTA_LOTE_DEADLINE_MS = 40000
+
+# Cuantas altas van al formulario (secuencial, ~30s c/u) por vuelta del loop.
+# El fast-path resuelve casi todo en paralelo; al formulario solo caen las
+# dudosas. Pero si el fast-path fallara en masa (plantilla vieja, panel raro)
+# y cayeran 40, procesarlas todas bloquearia el loop ~20 min sin reclamar
+# altas nuevas. Se procesan de a MAX_FORM_POR_VUELTA y el resto se libera para
+# la vuelta siguiente: el loop nunca queda monopolizado y sigue drenando.
+try:
+    MAX_FORM_POR_VUELTA = max(1, int(os.environ.get("ALTA_MAX_FORM", "8")))
+except ValueError:
+    MAX_FORM_POR_VUELTA = 8
+
 
 def cargar_plantilla() -> dict | None:
     """La plantilla aprendida, si existe y parece completa."""
@@ -1280,15 +1315,35 @@ def crear_jugador(page, reg: dict, dry_run: bool = False,
 # origen, asi que no hay CORS. Devuelve un status+texto por item, que Python
 # despues juzga con alta_api.evaluar_respuesta.
 _JS_LOTE = """
-async (items) => {
+async (payload) => {
+  const items = payload.items || [];
+  // Concurrencia ACOTADA a proposito: un Promise.all de N fetch a la vez, con
+  // N grande, le abre N conexiones de golpe al panel (que ya corta solas por
+  // socket hang up). Bajo un pico de 40 altas eso tumba la sesion y todas
+  // caen al formulario secuencial. Un pool de `conc` workers dispara en olas:
+  // muchas altas salen igual de rapido (cada una ~1s) pero el panel nunca ve
+  // mas de `conc` conexiones simultaneas. Ese es el punto que aguanta la
+  // concurrencia sin romperse.
+  const conc = Math.max(1, Math.min(payload.conc || 6, items.length || 1));
+  // Techo de tiempo del LOTE entero, no solo por item: aunque cada fetch tenga
+  // su timeout, N items en olas podrian sumar minutos si el panel cuelga todo.
+  // Al vencerse el deadline, los items que faltan se devuelven como status 0
+  // (timeout) sin ni intentar, y page.evaluate vuelve. Date.now() es del
+  // navegador (permitido), no del runtime del bot.
+  const deadline = Date.now() + (payload.deadline_ms || 40000);
   const out = [];
-  await Promise.all(items.map(async (it) => {
-    // Timeout propio por item: sin esto, un socket estancado del panel deja
-    // la promesa colgada para siempre, page.evaluate no vuelve nunca (no
-    // tiene timeout en Playwright) y el loop de altas ENTERO queda muerto
-    // sin un solo log. El abort corta tanto el fetch como el .text().
+  let idx = 0;
+
+  async function unItem(it) {
+    // Timeout propio por item, ACOTADO ademas por lo que falte para el
+    // deadline del lote: sin esto, un socket estancado del panel deja la
+    // promesa colgada para siempre, page.evaluate no vuelve nunca (no tiene
+    // timeout en Playwright) y el loop de altas ENTERO queda muerto sin un
+    // solo log. El abort corta tanto el fetch como el .text().
+    const restante = Math.max(500, deadline - Date.now());
+    const tope = Math.min(it.timeout_ms || 15000, restante);
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort('timeout'), it.timeout_ms || 45000);
+    const timer = setTimeout(() => ctrl.abort('timeout'), tope);
     try {
       const r = await fetch(it.url, {
         method: it.method || 'POST',
@@ -1307,7 +1362,27 @@ async (items) => {
     } finally {
       clearTimeout(timer);
     }
-  }));
+  }
+
+  async function worker() {
+    // Cada worker toma el proximo item libre hasta que no queden. idx++ es
+    // atomico en el event-loop de un solo hilo de JS: dos workers nunca
+    // agarran el mismo item.
+    while (idx < items.length) {
+      const it = items[idx++];
+      // Deadline del lote vencido: no arranco mas fetch, devuelvo timeout.
+      // Asi el pool no se estira aunque el panel cuelgue ola tras ola.
+      if (Date.now() > deadline) {
+        out.push({ i: it.i, status: 0, text: 'deadline del lote vencido' });
+        continue;
+      }
+      await unItem(it);
+    }
+  }
+
+  const workers = [];
+  for (let k = 0; k < conc; k++) workers.push(worker());
+  await Promise.all(workers);
   return out;
 }
 """
@@ -1347,6 +1422,7 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
             "method": plantilla.get("metodo", "POST"),
             "content_type": plantilla.get("content_type", "application/json"),
             "body": cuerpo,
+            "timeout_ms": ALTA_FETCH_TIMEOUT_MS,
         })
         porid[idx] = reg
 
@@ -1354,7 +1430,11 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
         return salida
 
     try:
-        respuestas = page.evaluate(_JS_LOTE, items)
+        respuestas = page.evaluate(_JS_LOTE, {
+            "items": items,
+            "conc": ALTA_CONCURRENCIA,
+            "deadline_ms": ALTA_LOTE_DEADLINE_MS,
+        })
     except Exception as e:
         # Si el evaluate entero falla (pagina navegando, sesion caida), NO se
         # da nada por creado: todos caen al formulario.
@@ -1715,7 +1795,10 @@ def main() -> int:
     ap.add_argument("--once", action="store_true", help="una sola pasada")
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="completa pero no envia")
-    ap.add_argument("--lote", type=int, default=10, help="registros por pasada")
+    # 40 y no 10: bajo un pico de registros conviene reclamar muchos de una y
+    # dispararlos por el fast-path en olas (ALTA_CONCURRENCIA), en vez de
+    # drenar de a 10 por vuelta. El server topa en 50 (altas_cola.php).
+    ap.add_argument("--lote", type=int, default=40, help="registros por pasada")
     ap.add_argument("--con-fichas", action="store_true",
                     help="en la misma pasada, ejecutar las cargas de saldo pendientes")
     ap.add_argument("--mantener-abierto", action="store_true",
@@ -1751,10 +1834,32 @@ def main() -> int:
         log.error("%s", e)
         return 1
 
-    # 3 segundos. Es un GET a NUESTRA API (no al panel), asi que sondear
-    # seguido no le cuesta nada a nadie -- y del otro lado hay alguien mirando
-    # "creando tu cuenta". Se puede subir con POLL_SEGUNDOS en el .env.
-    poll = int(os.environ.get("POLL_SEGUNDOS", 3))
+    # SONDEO ADAPTATIVO. El jugador NO tiene que esperar el intervalo de
+    # sondeo: apenas su alta entra a la cola, el bot la tiene que tomar. Por
+    # eso el intervalo no es fijo:
+    #   - Mientras hay altas (o acabo de procesar), sondeo cada POLL_MIN (~1s):
+    #     la cola se drena a toda velocidad y un alta nueva se toma casi al
+    #     instante.
+    #   - Recien cuando la cola queda vacia varias vueltas seguidas, el
+    #     intervalo sube de a poco hasta POLL_SEGUNDOS (el maximo, la calma),
+    #     para no hacer un GET por segundo cuando no hay nadie registrandose.
+    # Es un GET a NUESTRA API (no al panel), asi que sondear seguido no le
+    # cuesta nada a nadie -- y del otro lado hay alguien mirando "creando tu
+    # cuenta". POLL_SEGUNDOS pasa a ser el TECHO (default 30), no la espera fija.
+    poll_max = max(1, int(os.environ.get("POLL_SEGUNDOS", 30)))
+    try:
+        poll_min = max(0.3, float(os.environ.get("POLL_MIN_SEGUNDOS", "1")))
+    except ValueError:
+        poll_min = 1.0
+    if poll_min > poll_max:
+        poll_min = poll_max
+    espera = poll_min      # intervalo actual, se adapta vuelta a vuelta
+
+    # Las fichas NO corren en cada mini-vuelta del sondeo rapido: se martillaria
+    # el panel. Corren a su propio ritmo (cada poll_max), independiente del
+    # drenado de altas.
+    intervalo_fichas = poll_max
+    ultima_ficha = 0.0
 
     with sync_playwright() as p:
         browser, ctx = nuevo_contexto(p, headless=args.headless, con_sesion=True)
@@ -1776,7 +1881,9 @@ def main() -> int:
         log.info("Version del bot: %s. Si no coincide con `git log --oneline -1` "
                  "del repo, la imagen esta VIEJA: corre scripts/deploy-bot.sh.",
                  os.environ.get("BOT_VERSION", "desconocido"))
-        log.info("Sesion OK en %s. Escuchando la base cada %ss...", PANEL_URL, poll)
+        log.info("Sesion OK en %s. Sondeo adaptativo: %.1fs con cola, hasta %ds "
+                 "en calma. Lote %d, fast-path en olas de %d.",
+                 PANEL_URL, poll_min, poll_max, args.lote, ALTA_CONCURRENCIA)
 
         # Foto de la cola al arrancar. Es el diagnostico que mas veces faltó:
         # con el bot logueado y "escuchando", no habia forma de saber si la
@@ -1811,6 +1918,14 @@ def main() -> int:
                 except requests.RequestException as e:
                     log.error("API caida o inaccesible: %s", e)
                     lote = []
+
+                # Cuantas se RECLAMARON esta vuelta, antes de que el fast-path
+                # drene `lote`. La decision de sondeo se toma con esto, NO con
+                # `lote` (que el fast-path deja en [] cuando crea todo): sin
+                # esto, una vuelta 100% productiva por API se leia como "cola
+                # vacia" y el intervalo trepaba a 30s bajo rafaga -- justo la
+                # latencia que este rediseño elimina.
+                lote_reclamado = len(lote)
 
                 if lote:
                     log.info("%d registro(s) pendiente(s)", len(lote))
@@ -1876,6 +1991,22 @@ def main() -> int:
                         log.info("  fast-path: %d/%d creado(s) por API; %d al formulario",
                                  creados, len(lote), len(restantes))
                     lote = restantes
+
+                # Tope de formulario por vuelta: el formulario es secuencial
+                # (~30s c/u). Si cayeron muchas (fast-path en falla masiva),
+                # procesarlas todas aca bloquea el loop minutos sin reclamar
+                # altas nuevas -- head-of-line. Se atienden MAX_FORM_POR_VUELTA
+                # y el resto se libera para que la proxima vuelta las retome
+                # (idealmente ya por fast-path). Asi el loop nunca queda preso.
+                if len(lote) > MAX_FORM_POR_VUELTA:
+                    sobran = lote[MAX_FORM_POR_VUELTA:]
+                    lote = lote[:MAX_FORM_POR_VUELTA]
+                    try:
+                        api.liberar(ids=[r["id"] for r in sobran])
+                        log.info("  formulario: %d esta vuelta, %d liberadas para la proxima",
+                                 len(lote), len(sobran))
+                    except Exception as e:
+                        log.warning("  no pude liberar el excedente de formulario: %s", e)
 
                 for reg in lote:
                     etiqueta = f"{reg.get('id')} / {reg.get('usuario')}"
@@ -1965,7 +2096,14 @@ def main() -> int:
                 # Cargas de saldo, en el MISMO navegador. Dos procesos con la
                 # misma cuenta de agente se pisan la sesion, asi que conviene
                 # que las dos tareas compartan este login.
-                if args.con_fichas:
+                #
+                # POR INTERVALO, no en cada vuelta: con el sondeo adaptativo el
+                # loop puede girar cada ~1s drenando altas, y correr las fichas
+                # a ese ritmo martillaria el panel (y encima cada pasada abre el
+                # listado, que es pesado). Se procesan cada `intervalo_fichas`.
+                ahora = time.monotonic()
+                if args.con_fichas and (ahora - ultima_ficha >= intervalo_fichas):
+                    ultima_ficha = ahora
                     # Import adentro a proposito: bot_cargar_fichas nos importa
                     # a nosotros, y arriba seria una dependencia circular.
                     import bot_cargar_fichas as fichas
@@ -1984,16 +2122,32 @@ def main() -> int:
                 if args.once:
                     break
 
-                # Latido cada ~10 min. El loop no loguea nada cuando la cola
-                # esta vacia, asi que "todo tranquilo" y "el bot se colgo" se
-                # veian igual en pantalla -- y esperar 30 s mirando un log
-                # quieto no dice cual de las dos es.
-                ahora = time.monotonic()
-                if ahora - ultimo_latido >= 600:
+                # --- SONDEO ADAPTATIVO: la clave de que nadie espere ---
+                # Se decide con lote_reclamado (lo que se tomo ESTA vuelta), no
+                # con `lote` -- que el fast-path deja vacio cuando crea todo.
+                #   - Reclame el lote TOPADO (=args.lote): seguro hay mas en
+                #     cola, vuelvo a mirar YA (sin dormir).
+                #   - Reclame algo parcial: ya drene, pero puede llegar gente
+                #     del anuncio en cualquier momento -> sondeo rapido (poll_min).
+                #   - Cola vacia: el intervalo sube de a poco hasta poll_max.
+                # Asi una rafaga drena a fondo y la latencia con trafico es
+                # ~poll_min (1s) o menos, nunca 30s.
+                if lote_reclamado >= args.lote:
+                    espera = 0.0
                     ultimo_latido = ahora
-                    log.info("escuchando (cola vacia)")
+                elif lote_reclamado:
+                    espera = poll_min
+                    ultimo_latido = ahora   # hubo trabajo, no es "cola vacia"
+                else:
+                    espera = min(max(espera, poll_min) * 1.7, poll_max)
+                    # Latido cada ~10 min de calma: "todo tranquilo" y "el bot se
+                    # colgo" se veian igual en un log quieto.
+                    if ahora - ultimo_latido >= 600:
+                        ultimo_latido = ahora
+                        log.info("escuchando (cola vacia, sondeo cada %.0fs)", espera)
 
-                time.sleep(poll)
+                if espera > 0:
+                    time.sleep(espera)
 
         except KeyboardInterrupt:
             log.info("Cortado por el usuario")
