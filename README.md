@@ -14,9 +14,14 @@ Los dos comparten imagen: el sync importa el login de `bot_crear_jugador.py`.
 
 ## Deploy en el VPS
 
+> En el VPS real el clon vive en `~/Bot-python` (es el directorio que asumen
+> los scripts del repo principal, p. ej. `scripts/arreglar-bot-altas.sh` y los
+> avisos de Telegram). Si lo clonás con otro nombre van a convivir dos copias
+> con dos `.env`, y el script "arregla" una mientras corre la otra.
+
 ```bash
-git clone <tu-repo> ganamos-bot
-cd ganamos-bot
+git clone <tu-repo> Bot-python
+cd Bot-python
 
 cp .env.example .env
 nano .env                      # completar credenciales
