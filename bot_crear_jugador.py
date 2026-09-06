@@ -103,7 +103,8 @@ PLANTILLA_FILE = (SHOTS.parent / "alta_endpoint.json")
 
 # El fast-path (crear por API dentro del navegador, en paralelo) esta prendido
 # por defecto. ALTA_FAST=0 en el .env lo apaga y todo vuelve al formulario.
-FAST_ON = os.environ.get("ALTA_FAST", "1").strip() not in ("0", "false", "no", "")
+FAST_ON = os.environ.get("ALTA_FAST", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
 
 
 def cargar_plantilla() -> dict | None:
@@ -518,19 +519,38 @@ class ApiJugadores:
         r.raise_for_status()
         return r.json()
 
-    def liberar(self) -> int:
-        """Devuelve a 'pendiente' los que quedaron en 'procesando'."""
-        r = self.s.post(self.url, params={"accion": "liberar"}, timeout=20)
+    def liberar(self, ids: list | None = None) -> int:
+        """Devuelve a 'pendiente' los que quedaron en 'procesando'.
+
+        Con `ids` libera SOLO esos (los que reclamo ESTE proceso). Sin ids
+        libera todo, que es lo de siempre para destrabar a mano -- pero desde
+        el bot hay que pasar los propios: con dos instancias vivas (un deploy
+        solapado), el liberar global le devuelve a la cola los registros que
+        la OTRA instancia esta procesando en ese momento, y el alta sale dos
+        veces."""
+        cuerpo = {"ids": [int(i) for i in ids]} if ids else {}
+        r = self.s.post(self.url, params={"accion": "liberar"},
+                        json=cuerpo, timeout=20)
         r.raise_for_status()
         return int(r.json().get("liberados", 0))
 
-    def marcar(self, registro_id, estado: str, mensaje: str = "") -> None:
-        """estado: 'ok' | 'error'"""
+    def marcar(self, registro_id, estado: str, mensaje: str = "",
+               usuario: str = "") -> None:
+        """estado: 'ok' | 'error'
+
+        `usuario` es el nombre con el que ESTE proceso creo (o intento crear)
+        la cuenta. El server lo compara con el de la fila antes de aceptar un
+        'ok': si la cola renombro el alta en el medio (otro intento, otra
+        instancia), un ok tardio ya no puede confirmar credenciales de un
+        nombre que no es el que se creo."""
+        cuerpo = {"id": registro_id, "estado": estado, "mensaje": mensaje[:500]}
+        if usuario:
+            cuerpo["usuario"] = usuario
         try:
             r = self.s.post(
                 self.url,
                 params={"accion": "marcar"},
-                json={"id": registro_id, "estado": estado, "mensaje": mensaje[:500]},
+                json=cuerpo,
                 timeout=20,
             )
             r.raise_for_status()
@@ -978,9 +998,12 @@ def existe_en_panel(page, usuario: str) -> bool | None:
     # Palabra COMPLETA, no substring: 'ana' adentro de 'juana' daba falso
     # positivo, y un falso positivo aca marca el alta como creada -- o sea
     # credenciales entregadas para una cuenta que no existe, el peor error
-    # posible de este sistema. \b no alcanza porque el usuario puede empezar
-    # o terminar en . _ -, asi que el borde es "no letra/numero".
-    patron = r'(?<![a-zA-Z0-9])' + re.escape(usuario.lower()) + r'(?![a-zA-Z0-9])'
+    # posible de este sistema. \b no alcanza, y "no letra/numero" tampoco:
+    # los usernames llevan . _ - adentro, asi que buscar 'juan' matcheaba
+    # 'juan.perez' (OTRO jugador) y daba el mismo falso positivo. El borde es
+    # "nada de lo que puede formar un username".
+    patron = (r'(?<![a-zA-Z0-9._-])' + re.escape(usuario.lower())
+              + r'(?![a-zA-Z0-9._-])')
     return re.search(patron, texto.lower()) is not None
 
 
@@ -1025,6 +1048,11 @@ def enviar_formulario(page, reg: dict, captura_out: dict | None = None) -> tuple
             if es_respuesta_de_creacion(resp) and not resultado_post:
                 resultado_post["status"] = resp.status
                 resultado_post["url"] = resp.url
+                # El objeto respuesta entero: el CUERPO se lee despues, fuera
+                # del handler (aca adentro puede no estar disponible todavia).
+                # Sin el cuerpo no se puede distinguir el 200 real del 200
+                # mentiroso ({"status":1,"error_message":...}) de este panel.
+                resultado_post["resp"] = resp
                 # El cuerpo y el content-type del REQUEST, para aprender la
                 # plantilla del fast-path (alta_api). Best-effort: si no se
                 # puede leer, el formulario sigue funcionando igual, solo que
@@ -1076,22 +1104,58 @@ def _enviar_y_esperar(page, reg, capturas_red, resultado_post):
     aviso_30 = False
     while time.monotonic() < limite:
         # 1) La red contesto el POST de creacion: la señal mas confiable.
+        #    Pero el status solo NO alcanza: este panel responde 200 con el
+        #    error adentro ({"status":N,"error_message":"..."}), y tambien
+        #    200 SIN crear cuando el nombre ya es de un jugador de OTRO
+        #    agente. El cuerpo decide; si no decide, decide el listado.
         if resultado_post:
             st = resultado_post["status"]
-            if 200 <= st < 400:
-                return True, f"HTTP {st} {resultado_post['url']}"
-            # 4xx/5xx: el panel lo rechazo. El motivo, si esta, en pantalla.
-            errores = errores_de_validacion(page)
-            det = (" | ".join(errores[:3])) if errores else f"HTTP {st}"
-            return False, f"El panel rechazo la creacion: {det}"
+            cuerpo = ""
+            try:
+                cuerpo = resultado_post["resp"].text() or ""
+            except Exception:
+                pass
+            import alta_api
+            res, det = alta_api.evaluar_respuesta(st, cuerpo)
+            if res is True:
+                return True, f"HTTP {st} {resultado_post['url']} ({det})"
+            if res is False:
+                # Rechazo con certeza (p.ej. nombre ya existente). El motivo
+                # en pantalla, si esta, suma para el renombre de la cola.
+                errores = errores_de_validacion(page)
+                extra = (" | ".join(errores[:3])) if errores else det
+                return False, f"El panel rechazo la creacion: {extra}"
+            # Ambiguo (2xx sin señal positiva, 5xx): la unica respuesta
+            # honesta es el listado. El POST ya respondio, asi que navegar
+            # ya no aborta nada.
+            existe = existe_en_panel(page, str(reg.get("usuario", "")))
+            if existe is True:
+                return True, f"HTTP {st} y el jugador figura en el panel"
+            if existe is False:
+                return False, (f"HTTP {st} sin confirmacion y el jugador NO "
+                               f"figura en el listado ({det})")
+            return None, f"HTTP {st} sin confirmacion ({det})"
 
-        # 2) Navego fuera del formulario: creado.
+        # 2) Navego fuera del formulario. Antes esto era 'creado' a secas, y
+        #    el volantazo al login (sesion vencida) tambien caia aca: se
+        #    marcaba ok un alta que nunca entro. Solo el destino esperado
+        #    (/users/...) es señal de exito; el login es SesionExpirada; el
+        #    resto se verifica contra el listado.
         try:
             url = page.url
         except Exception:
             url = ""
         if url and base not in url.rstrip("/"):
-            return True, f"redirigio a {url}"
+            if es_pantalla_login(page):
+                raise SesionExpirada(url)
+            if "/users" in url:
+                return True, f"redirigio a {url}"
+            existe = existe_en_panel(page, str(reg.get("usuario", "")))
+            if existe is True:
+                return True, f"navego a {url} y el jugador figura en el panel"
+            if existe is False:
+                return False, f"navego a {url} y el jugador NO figura en el listado"
+            return None, f"navego a {url}, sin poder confirmar en el listado"
 
         # 3) Error de validacion visible: rechazado sin POST.
         errores = errores_de_validacion(page)
@@ -1189,6 +1253,23 @@ def crear_jugador(page, reg: dict, dry_run: bool = False,
         # y NUNCA por creada: de ahi salen credenciales que no abren nada.
         return False, f"Sin señal: {detalle}"
 
+    if ok is False:
+        # "Ya existe" merece una segunda mirada antes de mandarlo a renombrar:
+        # un intento ANTERIOR ambiguo (fetch cortado, sesion caida despues del
+        # submit) pudo haberlo creado con ESTA misma password. Si figura en
+        # nuestro listado, el alta esta hecha; renombrar aca dejaria una cuenta
+        # duplicada/huerfana con la clave del jugador.
+        try:
+            import alta_api
+            if alta_api._RX_YA_EXISTE.search(detalle or ""):
+                if existe_en_panel(page, str(reg.get("usuario", ""))) is True:
+                    return True, ("el nombre ya existia y figura en nuestro "
+                                  "panel: creado por un intento anterior")
+        except SesionExpirada:
+            raise
+        except Exception as e:
+            log.debug("no pude verificar el 'ya existe' contra el listado: %s", e)
+
     return ok, detalle
 
 
@@ -1202,20 +1283,29 @@ _JS_LOTE = """
 async (items) => {
   const out = [];
   await Promise.all(items.map(async (it) => {
+    // Timeout propio por item: sin esto, un socket estancado del panel deja
+    // la promesa colgada para siempre, page.evaluate no vuelve nunca (no
+    // tiene timeout en Playwright) y el loop de altas ENTERO queda muerto
+    // sin un solo log. El abort corta tanto el fetch como el .text().
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort('timeout'), it.timeout_ms || 45000);
     try {
       const r = await fetch(it.url, {
         method: it.method || 'POST',
         headers: { 'content-type': it.content_type || 'application/json' },
         body: it.body,
         credentials: 'include',
+        signal: ctrl.signal,
       });
       let t = '';
       try { t = await r.text(); } catch (e) {}
       out.push({ i: it.i, status: r.status, text: (t || '').slice(0, 600) });
     } catch (e) {
-      // status 0 = ni siquiera salio (red, CORS, lo que sea): Python lo trata
-      // como 'no se sabe' y lo manda al formulario.
+      // status 0 = ni siquiera salio (red, timeout, lo que sea): Python lo
+      // trata como 'no se sabe' y lo manda al formulario.
       out.push({ i: it.i, status: 0, text: String(e).slice(0, 200) });
+    } finally {
+      clearTimeout(timer);
     }
   }));
   return out;
@@ -1729,9 +1819,41 @@ def main() -> int:
                             creados += 1
                             log.info("  OK (API) %s / %s -> %s",
                                      reg.get("id"), reg.get("usuario"), msg)
-                            api.marcar(reg["id"], "ok", "creado por API: " + msg)
+                            api.marcar(reg["id"], "ok", "creado por API: " + msg,
+                                       usuario=str(reg.get("usuario", "")))
+                        elif res is False:
+                            # El panel dijo con CERTEZA "ese nombre ya existe".
+                            # Mandarlo al formulario con el mismo nombre era
+                            # tirar esa certeza: un submit condenado de 45s y
+                            # recien ahi el error. Lo que importa es de quien
+                            # es el nombre: si figura en NUESTRO listado, lo
+                            # creo un intento anterior con esta misma password
+                            # (alta hecha); si no, es de otro agente y la cola
+                            # tiene que renombrar YA.
+                            try:
+                                nuestro = existe_en_panel(
+                                    page, str(reg.get("usuario", "")))
+                            except Exception:
+                                nuestro = None
+                            if nuestro is True:
+                                creados += 1
+                                log.info("  OK (API) %s / %s -> ya figuraba en el panel",
+                                         reg.get("id"), reg.get("usuario"))
+                                api.marcar(reg["id"], "ok",
+                                           "ya figuraba en el panel (intento anterior)",
+                                           usuario=str(reg.get("usuario", "")))
+                            elif nuestro is False:
+                                log.warning("  %s / %s -> %s (a renombrar)",
+                                            reg.get("id"), reg.get("usuario"), msg)
+                                api.marcar(reg["id"], "error", msg,
+                                           usuario=str(reg.get("usuario", "")))
+                            else:
+                                # No se pudo mirar el listado: que decida el
+                                # formulario, que sabe verificar y re-loguear.
+                                restantes.append(reg)
                         else:
-                            # False (renombrar) o None (verificar): al formulario.
+                            # None (respuesta dudosa): al formulario, que
+                            # verifica contra el listado.
                             restantes.append(reg)
                     if creados:
                         log.info("  fast-path: %d/%d creado(s) por API; %d al formulario",
@@ -1751,9 +1873,11 @@ def main() -> int:
                             api.marcar(reg["id"], "error", "Sesion caida, sin re-login")
                             # El resto del lote sigue reclamado en 'procesando':
                             # sin esto quedaba colgado hasta el rescate de
-                            # zombies (15 min), con jugadores esperando.
+                            # zombies (15 min), con jugadores esperando. Se
+                            # liberan LOS PROPIOS, no toda la cola: un liberar
+                            # global pisa lo que este procesando otra instancia.
                             try:
-                                api.liberar()
+                                api.liberar(ids=[r["id"] for r in lote])
                             except Exception:
                                 pass
                             return 1
@@ -1764,12 +1888,24 @@ def main() -> int:
                             # login del proximo arranque), no puede tumbar el
                             # loop justo despues de recuperarlo.
                             log.warning("no pude guardar la sesion: %s", e)
+                        # La sesion pudo caerse DESPUES de enviar el formulario
+                        # (el volantazo al login se ve recien al ir al listado).
+                        # Reenviar a ciegas apila un SEGUNDO alta sobre el
+                        # primero: antes de reintentar, preguntarle al panel.
                         try:
-                            ok, msg = crear_jugador(page, reg, args.dry_run,
-                                        aprender=(aprendido if plantilla is None else None))
-                        except Exception as e:
-                            log.exception("Excepcion tras re-login en %s", etiqueta)
-                            ok, msg = False, f"Excepcion: {e}"
+                            ya = existe_en_panel(page, str(reg.get("usuario", "")))
+                        except Exception:
+                            ya = None
+                        if ya is True:
+                            ok, msg = True, ("tras el re-login, el jugador ya "
+                                             "figura en el panel")
+                        else:
+                            try:
+                                ok, msg = crear_jugador(page, reg, args.dry_run,
+                                            aprender=(aprendido if plantilla is None else None))
+                            except Exception as e:
+                                log.exception("Excepcion tras re-login en %s", etiqueta)
+                                ok, msg = False, f"Excepcion: {e}"
                     except Exception as e:
                         log.exception("Excepcion en %s", etiqueta)
                         ok, msg = False, f"Excepcion: {e}"
@@ -1790,7 +1926,8 @@ def main() -> int:
                                  "altas van por API en paralelo.")
 
                     if not args.dry_run:
-                        api.marcar(reg["id"], "ok" if ok else "error", msg)
+                        api.marcar(reg["id"], "ok" if ok else "error", msg,
+                                   usuario=str(reg.get("usuario", "")))
                     else:
                         # pendientes() RECLAMO este registro (lo paso a
                         # 'procesando'). En dry-run nadie lo marca, asi que sin

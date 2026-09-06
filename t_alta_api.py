@@ -83,10 +83,35 @@ chequear("un acento sobrevive", d2.get("firstName") == "José")
 print("\n=== Decidir si la respuesta es 'creado' ===")
 
 r, _ = A.evaluar_respuesta(200, '{"result":{"id":123,"username":"sofia_9"}}')
-chequear("2xx limpio = creado", r is True)
+chequear("2xx con result = creado", r is True)
 
+r, _ = A.evaluar_respuesta(200, '{"status":0,"result":{"id":9}}')
+chequear("2xx con status:0 = creado", r is True)
+
+r, _ = A.evaluar_respuesta(200, '{"error":null,"result":{"id":9}}')
+chequear("un error:null NO es un error", r is True)
+
+# El sobre real de esta plataforma: el error viene DENTRO del 2xx. Es el mismo
+# contrato que ve el colector al depositar (status != 0 = "lo rechace").
+r, _ = A.evaluar_respuesta(200, '{"status":1,"error_message":"User with username: x - already exist"}')
+chequear("2xx con error_message 'already exist' = renombrar (False)", r is False)
+
+r, _ = A.evaluar_respuesta(200, '{"status":1,"error_message":"Unauthorized"}')
+chequear("2xx con error_message de sesion = None (a verificar)", r is None)
+
+r, _ = A.evaluar_respuesta(200, '{"status":7}')
+chequear("2xx con status!=0 pelado = None, nunca creado", r is None)
+
+# Sin señal positiva no hay 'creado': un 200 vacio, de texto plano o HTML
+# (el fetch sigue redirects: sesion vencida => login con 200) no prueba nada.
 r, _ = A.evaluar_respuesta(201, "")
-chequear("201 sin cuerpo = creado", r is True)
+chequear("201 sin cuerpo = None (a verificar), no creado", r is None)
+
+r, _ = A.evaluar_respuesta(200, "OK")
+chequear("200 con texto plano = None", r is None)
+
+r, _ = A.evaluar_respuesta(200, "<html><body>login</body></html>")
+chequear("200 con HTML (login tras redirect) = None", r is None)
 
 r, _ = A.evaluar_respuesta(400, '{"error":"User with username - already exist"}')
 chequear("400 'already exist' = renombrar (False)", r is False)

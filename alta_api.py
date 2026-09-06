@@ -152,7 +152,7 @@ def evaluar_respuesta(status: int, texto: str) -> tuple[bool | None, str]:
     """Que hacer con la respuesta del POST de creacion.
 
     Devuelve (resultado, detalle):
-      True  -> creado. SOLO con 2xx y sin marca de error en el cuerpo.
+      True  -> creado. SOLO con 2xx y una señal POSITIVA en el cuerpo.
       False -> rechazado por nombre ya existente: hay que renombrar (lo hace
                la cola). Volver a mandar el MISMO nombre no sirve.
       None  -> no se sabe: 5xx, timeout, un cuerpo que no se entiende. El que
@@ -160,18 +160,54 @@ def evaluar_respuesta(status: int, texto: str) -> tuple[bool | None, str]:
 
     La regla de oro es la misma del formulario: ante la duda, NUNCA 'creado'.
     Un falso 'creado' entrega credenciales de una cuenta que no existe.
+
+    ESTA plataforma reporta errores DENTRO de un HTTP 2xx, con el sobre
+    {"status":N,"error_message":"..."} — igual que el deposito del colector,
+    que hace raise_for_status() y DESPUES chequea status != 0. Por eso un 2xx
+    pelado no alcanza: sin señal positiva (status==0, success:true o un
+    result/id) la respuesta es 'no se sabe', nunca 'creado'.
     """
     t = (texto or "")
     tl = t.lower()
 
     if 200 <= status < 300:
-        # 2xx con un cuerpo que grita error igual (algunos paneles contestan
-        # 200 y {"success":false}). Ante esa contradiccion, no arriesgar.
-        if '"success":false' in tl.replace(" ", "") or '"error"' in tl or '"errors"' in tl:
+        cuerpo = t.lstrip()
+        # HTML en un 2xx = el fetch siguio un redirect (tipicamente al login
+        # con la sesion vencida). Eso no crea nada.
+        if cuerpo.startswith("<"):
+            return None, "2xx pero el cuerpo es HTML (¿login?): a verificar"
+
+        d = None
+        if _parece_json(cuerpo):
+            try:
+                d = json.loads(cuerpo)
+            except Exception:
+                d = None
+        if not isinstance(d, dict):
+            return None, f"2xx sin cuerpo JSON: no confirma nada ({t[:80]})"
+
+        # error/error_message/errors CON contenido gritan error aunque el HTTP
+        # diga 200. Vacios o null ({"error":null}) no son un error: seguir.
+        err = d.get("error_message") or d.get("error") or d.get("errors")
+        if err:
+            if _RX_YA_EXISTE.search(str(err)) or _RX_YA_EXISTE.search(t):
+                return False, "nombre ya existente (2xx con error)"
+            return None, f"2xx pero el cuerpo reporta error: {str(err)[:120]}"
+        if d.get("success") is False:
             if _RX_YA_EXISTE.search(t):
                 return False, "nombre ya existente (2xx con error)"
-            return None, f"2xx pero el cuerpo reporta error: {t[:120]}"
-        return True, f"HTTP {status}"
+            return None, f"2xx pero success=false: {t[:120]}"
+        st_cuerpo = d.get("status")
+        if st_cuerpo not in (None, 0):
+            # El sobre de esta plataforma: status != 0 es "lo entendi y lo
+            # rechace", venga con error_message o sin el.
+            if _RX_YA_EXISTE.search(t):
+                return False, "nombre ya existente (2xx con status!=0)"
+            return None, f"2xx pero status={st_cuerpo} en el cuerpo: {t[:120]}"
+
+        if st_cuerpo == 0 or d.get("success") is True or d.get("result") or d.get("id"):
+            return True, f"HTTP {status} con señal positiva en el cuerpo"
+        return None, f"2xx sin señal positiva en el cuerpo: {t[:80]}"
 
     if status in (400, 409, 422) and _RX_YA_EXISTE.search(t):
         return False, "el panel dice que el nombre ya existe"
