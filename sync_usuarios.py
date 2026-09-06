@@ -120,9 +120,26 @@ def mostrar_campos(u: dict) -> None:
         print("No hay ningun campo de ultima conexion ni de email.")
 
 
+def _get_json(ctx, url, intentos: int = 4, espera: float = 2.0):
+    """GET con reintentos. El panel (en Moscú) corta la conexión seguido
+    ('socket hang up'); sin reintentar, una caída en CUALQUIER página aborta
+    toda la pasada y no se guarda nada. Backoff creciente entre intentos."""
+    ultimo = None
+    for i in range(intentos):
+        try:
+            return ctx.request.get(url, timeout=60_000).json()
+        except Exception as e:
+            ultimo = e
+            log.warning("  GET falló (intento %d/%d): %s",
+                        i + 1, intentos, str(e).splitlines()[0])
+            if i < intentos - 1:
+                time.sleep(espera * (i + 1))
+    raise ultimo
+
+
 def traer_todos(ctx, solo_campos: bool = False) -> list[dict]:
     """Pagina la API del panel y devuelve la lista completa de usuarios."""
-    me = ctx.request.get(f"{PANEL_API}/user/check").json()
+    me = _get_json(ctx, f"{PANEL_API}/user/check")
     agent_id = me["result"]["id"]
     log.info("Agente %s (id %s)", me["result"]["username"], agent_id)
 
@@ -130,7 +147,7 @@ def traer_todos(ctx, solo_campos: bool = False) -> list[dict]:
     while pag < 500:
         url = (f"{PANEL_API}/agent_admin/user/?count={POR_PAGINA}&page={pag}"
                f"&user_id={agent_id}&is_banned=false&is_direct_structure=false")
-        data = ctx.request.get(url).json()
+        data = _get_json(ctx, url)
         items = items_de(data) or []
         if not items:
             break
