@@ -175,5 +175,19 @@ chequear("id booleano no cuenta", A.extraer_id_ganamos('{"id":true}') is None)
 chequear("id cero no cuenta", A.extraer_id_ganamos('{"id":0}') is None)
 chequear("HTML no rompe", A.extraer_id_ganamos('<html>login</html>') is None)
 
+# ---------------------------------------------------------------------------
+print("\n=== Deposito de fichas: que hacer con cada status ===")
+
+chequear("200 = hecha", A.evaluar_deposito(200) == "hecha")
+chequear("201 = hecha", A.evaluar_deposito(201) == "hecha")
+chequear("400 = error (rechazo)", A.evaluar_deposito(400) == "error")
+chequear("403 = error", A.evaluar_deposito(403) == "error")
+chequear("404 = error", A.evaluar_deposito(404) == "error")
+chequear("408 = revisar (no rechazo)", A.evaluar_deposito(408) == "revisar")
+chequear("429 = revisar", A.evaluar_deposito(429) == "revisar")
+chequear("500 = revisar (pudo entrar)", A.evaluar_deposito(500) == "revisar")
+chequear("502 = revisar", A.evaluar_deposito(502) == "revisar")
+chequear("0 = revisar", A.evaluar_deposito(0) == "revisar")
+
 print(f"\n---------------------------------------\n{ok} OK, {fail} fallas")
 sys.exit(1 if fail else 0)

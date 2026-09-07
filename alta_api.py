@@ -121,6 +121,26 @@ def _parece_json(cuerpo: str) -> bool:
     return t.startswith("{") or t.startswith("[")
 
 
+def evaluar_deposito(status: int) -> str:
+    """Que hacer con la respuesta del POST de deposito de fichas.
+
+    Misma semantica conservadora de ejecutar_cargas.py, porque aca se mueve
+    plata: ante cualquier duda, NUNCA se reintenta (reintentar un deposito que
+    quizas entro es depositar dos veces).
+
+        'hecha'   -> 2xx: el panel lo acepto.
+        'error'   -> 4xx (menos 408/429): el server RECHAZO y no lo proceso.
+                     La cola devuelve las fichas.
+        'revisar' -> 5xx / 408 / 429 / status raro: pudo haber entrado igual.
+                     Lo mira una persona; no se reintenta solo.
+    """
+    if 200 <= status < 300:
+        return "hecha"
+    if 400 <= status < 500 and status not in (408, 429):
+        return "error"
+    return "revisar"
+
+
 def extraer_id_ganamos(texto: str) -> int | None:
     """El id del jugador EN GANAMOS, de la respuesta del POST de creacion.
 

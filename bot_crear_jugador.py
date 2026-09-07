@@ -117,6 +117,13 @@ try:
 except ValueError:
     ALTA_CONCURRENCIA = 6
 
+# Depositar las fichas de las recargas acreditadas (camino B) EN EL MISMO bot,
+# por API. Prendido por defecto: reemplaza al viejo --con-fichas (listado
+# lento y falible) y no depende de un worker aparte que hay que acordarse de
+# levantar. ALTA_DEPOSITA=0 lo apaga.
+DEPOSITA_ON = os.environ.get("ALTA_DEPOSITA", "1").strip().lower() not in (
+    "0", "false", "no", "off", "")
+
 # Timeout por fetch (ms) y techo de tiempo del lote entero. El page.evaluate
 # que dispara el pool es BLOQUEANTE y Playwright no le pone timeout: si el
 # panel deja sockets colgados, sin estos topes el loop de altas se congela
@@ -1490,6 +1497,102 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
     return salida
 
 
+# ---------------------------------------------------------------------------
+# Deposito de fichas (camino B: recarga acreditada -> fichas al juego)
+# ---------------------------------------------------------------------------
+# operation=0 es DEPOSITO en la API del panel (CLAUDE.md / ejecutar_cargas.py).
+OP_DEPOSITO = 0
+
+
+def _url_acciones(api_url: str) -> str:
+    """De .../altas_cola.php saca .../acciones_cola.php (mismo directorio)."""
+    base = (api_url or "").split("?")[0]
+    return base.rsplit("/", 1)[0] + "/acciones_cola.php"
+
+
+def _depositar_una(page, id_ganamos: int, monto: float) -> tuple[str, str]:
+    """UN deposito por la API del panel, con page.context.request (misma sesion,
+    con timeout, sin navegador que se cuelgue). Monto ENTERO: la plataforma
+    trabaja en pesos enteros. Devuelve (estado, detalle) -- ver evaluar_deposito."""
+    import alta_api
+    url = f"{PANEL_API}/agent_admin/user/{int(id_ganamos)}/payment/"
+    try:
+        r = page.context.request.post(
+            url, data={"operation": OP_DEPOSITO, "amount": int(round(monto))},
+            timeout=45_000)
+        st = r.status
+        try:
+            txt = r.text()[:300]
+        except Exception:
+            txt = ""
+    except Exception as e:
+        # No se sabe si el server lo proceso antes de cortarse: nunca 'error'.
+        return "revisar", f"no se pudo confirmar el deposito ({e})"
+    estado = alta_api.evaluar_deposito(st)
+    return estado, f"deposito por API ({st}) {txt}".strip()
+
+
+def depositar_fichas_pendientes(page, api) -> int:
+    """Deposita en el panel las cargas que la recarga por transferencia dejo en
+    la cola (acciones_saldo). Reemplaza al viejo --con-fichas (bot_cargar_fichas,
+    por listado, 13 hechas contra 28 errores) con el mismo mecanismo API que el
+    alta: comparte la sesion del bot, tiene timeout y no se cuelga.
+
+    Semantica de plata (igual que ejecutar_cargas.py): hecha / error / revisar,
+    y ante cualquier duda NO se reintenta. La cola reclama la accion ANTES de
+    entregarla, asi que dos procesos no depositan lo mismo dos veces."""
+    url_acc = _url_acciones(api.url)
+    try:
+        r = api.s.get(url_acc, params={"accion": "pendientes", "limite": 20}, timeout=20)
+        r.raise_for_status()
+        acciones = (r.json() or {}).get("datos", []) or []
+    except Exception as e:
+        log.error("fichas: no pude leer la cola de cargas (%s): %s", url_acc, e)
+        return 0
+    if not acciones:
+        return 0
+
+    def marcar(id_accion, estado, msg):
+        try:
+            resp = api.s.post(url_acc, params={"accion": "marcar"},
+                              json={"id": id_accion, "estado": estado,
+                                    "mensaje": (msg or "")[:300]}, timeout=20)
+            resp.raise_for_status()
+        except Exception as e:
+            log.error("fichas: no pude marcar la accion %s como %s: %s",
+                      id_accion, estado, e)
+
+    hechas = 0
+    for a in acciones:
+        idA   = int(a.get("id") or 0)
+        tipo  = (a.get("tipo") or "").strip()
+        usr   = (a.get("usuario") or "").strip()
+        monto = float(a.get("monto") or 0)
+        gid   = a.get("usuario_id")
+
+        if tipo != "cargar":
+            # Los retiros los aprueba un agente: se dejan sin tocar.
+            marcar(idA, "revisar", "retiro: lo resuelve un agente")
+            continue
+        if not gid:
+            # Sin el id de ganamos no hay a quien depositarle. NO es 'error'
+            # (eso devolveria las fichas por un problema nuestro de espejado):
+            # que lo mire una persona. Con la migracion 55 esto casi no pasa.
+            marcar(idA, "revisar",
+                   f"sin id de ganamos de '{usr}' (¿corrio el sync de usuarios?)")
+            log.warning("  ficha %s / %s: sin id de ganamos", idA, usr)
+            continue
+
+        estado, detalle = _depositar_una(page, int(gid), monto)
+        marcar(idA, estado, detalle)
+        if estado == "hecha":
+            hechas += 1
+            log.info("  ficha OK %s / %s / %s (id %s) -> %s",
+                     idA, usr, int(round(monto)), gid, detalle[:100])
+        else:
+            log.warning("  ficha %s / %s: %s -> %s", idA, usr, estado.upper(), detalle[:140])
+    return hechas
+
 
 # ---------------------------------------------------------------------------
 # Navegador
@@ -1922,8 +2025,9 @@ def main() -> int:
                  "del repo, la imagen esta VIEJA: corre scripts/deploy-bot.sh.",
                  os.environ.get("BOT_VERSION", "desconocido"))
         log.info("Sesion OK en %s. Sondeo adaptativo: %.1fs con cola, hasta %ds "
-                 "en calma. Lote %d, fast-path en olas de %d.",
-                 PANEL_URL, poll_min, poll_max, args.lote, ALTA_CONCURRENCIA)
+                 "en calma. Lote %d, fast-path en olas de %d. Deposito de fichas: %s.",
+                 PANEL_URL, poll_min, poll_max, args.lote, ALTA_CONCURRENCIA,
+                 "ON (por API, en este bot)" if DEPOSITA_ON else "OFF (ALTA_DEPOSITA=0)")
 
         # Foto de la cola al arrancar. Es el diagnostico que mas veces faltó:
         # con el bot logueado y "escuchando", no habia forma de saber si la
@@ -2162,26 +2266,22 @@ def main() -> int:
                     # deja lo minimo para que el SPA termine de reacomodarse.
                     time.sleep(random.uniform(0.3, 0.6))
 
-                # Cargas de saldo, en el MISMO navegador. Dos procesos con la
-                # misma cuenta de agente se pisan la sesion, asi que conviene
-                # que las dos tareas compartan este login.
+                # Deposito de fichas (recarga acreditada -> fichas al juego),
+                # por API, en el MISMO bot y con la MISMA sesion. Antes esto lo
+                # hacia un worker aparte (ejecutar_cargas.py) que habia que
+                # acordarse de tener corriendo -- y no estaba: la plata entraba
+                # y las fichas no llegaban. Aca no se puede olvidar.
                 #
-                # POR INTERVALO y SOLO CON LA COLA DE ALTAS VACIA. Las fichas
-                # son el trabajo lento del loop (buscar en el listado puede
-                # tardar 45s POR CARGA, y una carga trabada reintenta): si
-                # corren mientras hay altas esperando, el jugador del registro
-                # paga la demora de una carga ajena. Las altas mandan; las
-                # fichas usan los huecos de calma. Una carga puede esperar
-                # unos segundos mas; un jugador mirando "creando tu cuenta" no.
+                # SOLO CON LA COLA DE ALTAS VACIA y por intervalo: las altas
+                # mandan (un jugador mirando "creando tu cuenta" no puede
+                # esperar detras de un deposito), pero un deposito puede esperar
+                # unos segundos. Es rapido igual (un POST, no un listado).
                 ahora = time.monotonic()
-                if (args.con_fichas and lote_reclamado == 0
+                if (DEPOSITA_ON and lote_reclamado == 0
                         and (ahora - ultima_ficha >= intervalo_fichas)):
                     ultima_ficha = ahora
-                    # Import adentro a proposito: bot_cargar_fichas nos importa
-                    # a nosotros, y arriba seria una dependencia circular.
-                    import bot_cargar_fichas as fichas
                     try:
-                        fichas.procesar_pendientes(page)
+                        depositar_fichas_pendientes(page, api)
                     except SesionExpirada:
                         log.warning("Sesion caida durante las fichas, re-logueando...")
                         if not login_automatico(page):
@@ -2189,8 +2289,8 @@ def main() -> int:
                             return 1
                         guardar_sesion(ctx, page)
                     except Exception:
-                        # Una carga que falla no puede tumbar el loop de altas.
-                        log.exception("Error procesando la cola de saldo")
+                        # Un deposito que falla no puede tumbar el loop de altas.
+                        log.exception("Error procesando la cola de fichas")
 
                 if args.once:
                     break

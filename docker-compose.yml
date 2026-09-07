@@ -25,14 +25,13 @@ services:
     init: true
     volumes:
       - ./datos:/datos
-    # SIN --con-fichas (6/9/2026). Las cargas de saldo las ejecuta el colector
-    # del VPS (ejecutar_cargas.py, cron cada minuto, un POST a la API) desde
-    # que el camino por listado de bot_cargar_fichas quedo obsoleto (13 cargas
-    # contra 28 errores). Tenerlo TAMBIEN aca era redundante y ademas colgaba
-    # las altas: una accion trabada en fichas quema minutos en el mismo hilo
-    # del loop, y el jugador del registro paga la espera. Este bot hace UNA
-    # cosa: altas. Si algun dia hay que correr fichas a mano:
-    #   docker compose run --rm creador python /app/bot_crear_jugador.py --headless --con-fichas --once
+    # El bot crea altas Y deposita las fichas de las recargas acreditadas, las
+    # dos por API y con la MISMA sesion (7/9/2026). El deposito lo hacia antes
+    # --con-fichas (bot_cargar_fichas, por listado, 13/28) o un worker aparte
+    # (ejecutar_cargas.py) que habia que acordarse de levantar -- y no estaba,
+    # asi que la plata entraba y las fichas no llegaban. Ahora vive en el mismo
+    # loop (depositar_fichas_pendientes), corre solo cuando la cola de altas
+    # esta vacia (las altas mandan), y se apaga con ALTA_DEPOSITA=0.
     command: ["python", "/app/bot_crear_jugador.py", "--headless"]
     logging:
       driver: json-file
