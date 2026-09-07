@@ -61,6 +61,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -1927,11 +1928,39 @@ def main() -> int:
             log.info("Fast-path ON: sin plantilla todavia; la aprendo del primer "
                      "alta por formulario.")
 
+        # WATCHDOG. page.evaluate (el fast-path) es BLOQUEANTE y Playwright no le
+        # pone timeout: si la pagina del navegador queda en mal estado, evaluate
+        # no vuelve NUNCA y el loop entero se cuelga en silencio -- el proceso
+        # sigue vivo (no reinicia), deja de sondear y las altas no se crean sin
+        # un solo error. Paso el 6/9/2026: creo dos altas y quedo mudo.
+        # El loop toca `_wd_latido[0]` en cada vuelta; este hilo lo vigila y, si
+        # se queda quieto mas de WD_TIMEOUT, mata el proceso -- Docker lo levanta
+        # con navegador fresco (restart: unless-stopped). Un cuelgue se auto-cura
+        # en ~1-2 min en vez de para siempre.
+        try:
+            _wd_timeout = max(30, int(os.environ.get("ALTA_WATCHDOG_SEG", "90")))
+        except ValueError:
+            _wd_timeout = 90
+        _wd_latido = [time.monotonic()]
+
+        def _watchdog():
+            while True:
+                time.sleep(15)
+                quieto = time.monotonic() - _wd_latido[0]
+                if quieto > _wd_timeout:
+                    log.error("WATCHDOG: el loop lleva %.0fs sin avanzar "
+                              "(page.evaluate colgado?). Reinicio el proceso para "
+                              "que Docker lo levante con navegador fresco.", quieto)
+                    os._exit(1)
+
+        threading.Thread(target=_watchdog, daemon=True).start()
+
         ultimo_latido = time.monotonic()
         dry_reclamados = []      # ids tomados en --dry-run, para devolverlos
         aprendido: dict = {}     # se llena cuando el formulario ensena la plantilla
         try:
             while True:
+                _wd_latido[0] = time.monotonic()   # "sigo vivo" para el watchdog
                 try:
                     lote = api.pendientes(args.lote)
                 except ErrorApi as e:
@@ -2033,6 +2062,7 @@ def main() -> int:
                         log.warning("  no pude liberar el excedente de formulario: %s", e)
 
                 for reg in lote:
+                    _wd_latido[0] = time.monotonic()   # cada alta cuenta como avance
                     etiqueta = f"{reg.get('id')} / {reg.get('usuario')}"
                     log.info("Creando jugador %s", etiqueta)
                     try:
