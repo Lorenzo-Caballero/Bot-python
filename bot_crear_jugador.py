@@ -1856,7 +1856,18 @@ def main() -> int:
     # Es un GET a NUESTRA API (no al panel), asi que sondear seguido no le
     # cuesta nada a nadie -- y del otro lado hay alguien mirando "creando tu
     # cuenta". POLL_SEGUNDOS pasa a ser el TECHO (default 30), no la espera fija.
-    poll_max = max(1, int(os.environ.get("POLL_SEGUNDOS", 30)))
+    # El TECHO de calma se acota a 5s. POLL_SEGUNDOS quedo del bot viejo
+    # (sondeo FIJO) y en los .env desplegados vale 30: usado como techo
+    # significaba que la PRIMERA alta tras una calma esperaba hasta 30s solo
+    # para que el bot mirara la cola -- el sintoma exacto de "sigue tardando".
+    # El GET a nuestra API es gratis; no hay razon para mirar tan de vez en
+    # cuando. Si de verdad se quiere un techo mas alto: ALTA_POLL_MAX.
+    try:
+        poll_max = max(1.0, float(os.environ.get(
+            "ALTA_POLL_MAX",
+            str(min(int(os.environ.get("POLL_SEGUNDOS", 3)), 5)))))
+    except ValueError:
+        poll_max = 3.0
     try:
         poll_min = max(0.3, float(os.environ.get("POLL_MIN_SEGUNDOS", "1")))
     except ValueError:
@@ -1865,10 +1876,13 @@ def main() -> int:
         poll_min = poll_max
     espera = poll_min      # intervalo actual, se adapta vuelta a vuelta
 
-    # Las fichas NO corren en cada mini-vuelta del sondeo rapido: se martillaria
-    # el panel. Corren a su propio ritmo (cada poll_max), independiente del
-    # drenado de altas.
-    intervalo_fichas = poll_max
+    # Las fichas corren a su PROPIO ritmo (default 30s), independiente del
+    # sondeo de altas: ni en cada mini-vuelta rapida (martillaria el panel) ni
+    # atadas al techo de calma.
+    try:
+        intervalo_fichas = max(5, int(os.environ.get("FICHAS_CADA_SEGUNDOS", 30)))
+    except ValueError:
+        intervalo_fichas = 30
     ultima_ficha = 0.0
 
     with sync_playwright() as p:
@@ -2107,12 +2121,16 @@ def main() -> int:
                 # misma cuenta de agente se pisan la sesion, asi que conviene
                 # que las dos tareas compartan este login.
                 #
-                # POR INTERVALO, no en cada vuelta: con el sondeo adaptativo el
-                # loop puede girar cada ~1s drenando altas, y correr las fichas
-                # a ese ritmo martillaria el panel (y encima cada pasada abre el
-                # listado, que es pesado). Se procesan cada `intervalo_fichas`.
+                # POR INTERVALO y SOLO CON LA COLA DE ALTAS VACIA. Las fichas
+                # son el trabajo lento del loop (buscar en el listado puede
+                # tardar 45s POR CARGA, y una carga trabada reintenta): si
+                # corren mientras hay altas esperando, el jugador del registro
+                # paga la demora de una carga ajena. Las altas mandan; las
+                # fichas usan los huecos de calma. Una carga puede esperar
+                # unos segundos mas; un jugador mirando "creando tu cuenta" no.
                 ahora = time.monotonic()
-                if args.con_fichas and (ahora - ultima_ficha >= intervalo_fichas):
+                if (args.con_fichas and lote_reclamado == 0
+                        and (ahora - ultima_ficha >= intervalo_fichas)):
                     ultima_ficha = ahora
                     # Import adentro a proposito: bot_cargar_fichas nos importa
                     # a nosotros, y arriba seria una dependencia circular.
