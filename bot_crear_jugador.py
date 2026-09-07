@@ -1395,88 +1395,79 @@ async (payload) => {
 """
 
 
+def _mismo_endpoint(a: str, b: str) -> bool:
+    """Dos URLs apuntan al mismo endpoint (ignora query y barra final)."""
+    na = (a or "").split("?")[0].rstrip("/")
+    nb = (b or "").split("?")[0].rstrip("/")
+    return na == nb
+
+
 def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
-    """Crea VARIOS jugadores a la vez por la API, desde el navegador.
+    """Crea jugadores por la API del panel usando el APIRequestContext de
+    Playwright (page.context.request), NO page.evaluate.
 
-    Devuelve {id_reg: (resultado, msg)} donde resultado es True (creado),
-    False (nombre ya existe: al formulario, que renombra) o None (no se sabe:
-    al formulario, que verifica).
+    Por que cambio (6/9/2026): el fast-path corria con page.evaluate(fetch),
+    que depende de una PAGINA del navegador. Esa pagina queda abierta horas y
+    se degrada (el SPA navega solo, el tab crashea en headless); ahi evaluate
+    NO VUELVE NUNCA -- no tiene timeout del lado de Python -- y el loop entero
+    queda mudo. El sintoma era exacto: creaba UN alta y se colgaba en la
+    siguiente, una y otra vez (el watchdog lo revivia cada ~90s: altas cada
+    minuto en vez de cada segundo).
 
-    NO marca nada ni toca la cola: solo intenta y reporta. La decision de que
-    hacer con cada resultado la toma el loop, que es el que tiene la cola.
+    context.request es una llamada HTTP de verdad: comparte la sesion (las
+    cookies del navegador logueado), tiene TIMEOUT real y NO toca ninguna
+    pagina, asi que no puede colgarse. Se puede porque agents.ganamosonline.com
+    NO esta detras del WAF (ver CLAUDE.md): no hace falta el TLS de Chrome para
+    cruzarlo. Si algun dia SI se protegiera, la request fallaria limpio (o
+    devolveria el challenge HTML) y el reg caeria al formulario -- nunca a un
+    cuelgue.
+
+    Secuencial: cada POST es ~300ms-1s. Un lote de N tarda N*eso, sin colgarse.
+    Devuelve {id_reg: (True|False|None, msg)}. No marca ni toca la cola.
     """
     import alta_api
 
-    items = []
-    porid = {}
+    req = page.context.request
+    url = plantilla["url"]
+    metodo = (plantilla.get("metodo") or "POST").upper()
+    content_type = plantilla.get("content_type", "application/json")
     salida = {}
-    for idx, reg in enumerate(regs):
+
+    for reg in regs:
         try:
             datos = completar_datos(reg)
-            # El fast-path manda EXACTAMENTE lo mismo que tiparia el formulario.
+            # Manda EXACTAMENTE lo mismo que tiparia el formulario.
             cuerpo = alta_api.render_cuerpo(plantilla, {
                 "usuario": datos["usuario"], "password": datos["password"],
                 "email": datos["email"], "nombre": datos["nombre"],
                 "apellido": datos["apellido"],
             })
         except Exception as e:
-            # Un reg que no se puede armar cae al formulario, no rompe el lote.
             salida[reg["id"]] = (None, f"no pude armar el cuerpo: {e}")
             continue
-        items.append({
-            "i": idx,
-            "url": plantilla["url"],
-            "method": plantilla.get("metodo", "POST"),
-            "content_type": plantilla.get("content_type", "application/json"),
-            "body": cuerpo,
-            "timeout_ms": ALTA_FETCH_TIMEOUT_MS,
-        })
-        porid[idx] = reg
 
-    if not items:
-        return salida
-
-    # PAGINA FRESCA por lote, no la del formulario. La page principal queda
-    # abierta horas y el tab se puede degradar (SPA navegando solo, tab
-    # crasheado en headless): un evaluate sobre esa pagina zombie NO VUELVE
-    # NUNCA y el loop entero queda mudo -- paso el 6/9: dos altas perfectas y
-    # despues silencio total. Abrir un tab nuevo (~1s, misma sesion via el
-    # contexto), navegar al panel, disparar el lote y cerrarlo elimina el
-    # estado viejo de la ecuacion. El watchdog queda como ultima red.
-    pagina_lote = None
-    try:
-        pagina_lote = page.context.new_page()
-        pagina_lote.goto(PANEL_RAIZ, wait_until="domcontentloaded", timeout=15_000)
-        respuestas = pagina_lote.evaluate(_JS_LOTE, {
-            "items": items,
-            "conc": ALTA_CONCURRENCIA,
-            "deadline_ms": ALTA_LOTE_DEADLINE_MS,
-        })
-    except Exception as e:
-        # Si el evaluate entero falla (pagina navegando, sesion caida), NO se
-        # da nada por creado: todos caen al formulario.
-        log.warning("  fast-path: el lote por fetch fallo entero (%s); al formulario", e)
-        return {reg["id"]: (None, f"fetch fallo: {e}") for reg in regs}
-    finally:
-        if pagina_lote is not None:
+        try:
+            resp = req.fetch(
+                url, method=metodo, data=cuerpo,
+                headers={"content-type": content_type},
+                timeout=ALTA_FETCH_TIMEOUT_MS, max_redirects=20,
+            )
+            st = resp.status
             try:
-                pagina_lote.close()
+                txt = resp.text()
             except Exception:
-                pass
-
-    for r in respuestas or []:
-        reg = porid.get(r.get("i"))
-        if reg is None:
+                txt = ""
+            final_url = resp.url or ""
+        except Exception as e:
+            # Timeout / red / sesion: NO se da por creado. Al formulario, que
+            # verifica y re-loguea. Nunca un cuelgue: fetch tiene timeout.
+            salida[reg["id"]] = (None, f"request fallo: {e}")
+            log.info("  fast-path %s / %s: request fallo -> al formulario | %s",
+                     reg.get("id"), reg.get("usuario"), str(e).splitlines()[0][:120])
             continue
-        st = int(r.get("status", 0))
-        txt = r.get("text", "")
-        redir = bool(r.get("redirected"))
-        final_url = str(r.get("finalUrl", ""))
+
+        redir = bool(final_url) and not _mismo_endpoint(final_url, url)
         res, msg = alta_api.evaluar_respuesta(st, txt, redirected=redir, url_final=final_url)
-        # El status, el redirect y el cuerpo CRUDOS del panel, siempre. Es la
-        # unica forma de entender por que el fast-path juzga 'creado' /
-        # 'renombrar' / 'dudoso' sin adivinar: si cae al formulario cada vez
-        # (alta lenta), aca esta el motivo exacto -- que devuelve el panel.
         veredicto = ("creado" if res is True else
                      "renombrar" if res is False else "al formulario")
         log.info("  fast-path %s / %s: HTTP %s%s -> %s | %s",
@@ -1485,9 +1476,7 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
                  veredicto,
                  msg if res is not None else ("cuerpo: " + (txt or "").replace("\n", " ")[:160]))
         salida[reg["id"]] = (res, msg)
-    # Cualquier item sin respuesta (no deberia pasar) -> al formulario.
-    for reg in regs:
-        salida.setdefault(reg["id"], (None, "sin respuesta del fetch"))
+
     return salida
 
 
