@@ -571,17 +571,24 @@ class ApiJugadores:
         return int(r.json().get("liberados", 0))
 
     def marcar(self, registro_id, estado: str, mensaje: str = "",
-               usuario: str = "") -> None:
+               usuario: str = "", id_ganamos=None) -> None:
         """estado: 'ok' | 'error'
 
         `usuario` es el nombre con el que ESTE proceso creo (o intento crear)
         la cuenta. El server lo compara con el de la fila antes de aceptar un
         'ok': si la cola renombro el alta en el medio (otro intento, otra
         instancia), un ok tardio ya no puede confirmar credenciales de un
-        nombre que no es el que se creo."""
+        nombre que no es el que se creo.
+
+        `id_ganamos` es el id del jugador EN LA PLATAFORMA, capturado de la
+        respuesta del panel al crearlo. Se guarda en la fila para que el
+        deposito de fichas tenga el id sin depender del sync (ver migracion
+        55). Opcional: si no se pudo capturar, no se manda."""
         cuerpo = {"id": registro_id, "estado": estado, "mensaje": mensaje[:500]}
         if usuario:
             cuerpo["usuario"] = usuario
+        if id_ganamos:
+            cuerpo["id_ganamos"] = int(id_ganamos)
         try:
             r = self.s.post(
                 self.url,
@@ -1443,7 +1450,7 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
                 "apellido": datos["apellido"],
             })
         except Exception as e:
-            salida[reg["id"]] = (None, f"no pude armar el cuerpo: {e}")
+            salida[reg["id"]] = (None, f"no pude armar el cuerpo: {e}", None)
             continue
 
         try:
@@ -1461,21 +1468,24 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
         except Exception as e:
             # Timeout / red / sesion: NO se da por creado. Al formulario, que
             # verifica y re-loguea. Nunca un cuelgue: fetch tiene timeout.
-            salida[reg["id"]] = (None, f"request fallo: {e}")
+            salida[reg["id"]] = (None, f"request fallo: {e}", None)
             log.info("  fast-path %s / %s: request fallo -> al formulario | %s",
                      reg.get("id"), reg.get("usuario"), str(e).splitlines()[0][:120])
             continue
 
         redir = bool(final_url) and not _mismo_endpoint(final_url, url)
         res, msg = alta_api.evaluar_respuesta(st, txt, redirected=redir, url_final=final_url)
+        # Si se creo, capturar el id de ganamos del cuerpo: lo necesita el
+        # deposito de fichas y asi no depende del sync (ver extraer_id_ganamos).
+        gid = alta_api.extraer_id_ganamos(txt) if res is True else None
         veredicto = ("creado" if res is True else
                      "renombrar" if res is False else "al formulario")
-        log.info("  fast-path %s / %s: HTTP %s%s -> %s | %s",
+        log.info("  fast-path %s / %s: HTTP %s%s -> %s%s | %s",
                  reg.get("id"), reg.get("usuario"), st,
                  (" redir->" + final_url[:60]) if redir else "",
-                 veredicto,
+                 veredicto, (" id=" + str(gid)) if gid else "",
                  msg if res is not None else ("cuerpo: " + (txt or "").replace("\n", " ")[:160]))
-        salida[reg["id"]] = (res, msg)
+        salida[reg["id"]] = (res, msg, gid)
 
     return salida
 
@@ -2004,13 +2014,13 @@ def main() -> int:
                     restantes = []
                     creados = 0
                     for reg in lote:
-                        res, msg = resultados.get(reg["id"], (None, "sin respuesta"))
+                        res, msg, gid = resultados.get(reg["id"], (None, "sin respuesta", None))
                         if res is True:
                             creados += 1
                             log.info("  OK (API) %s / %s -> %s",
                                      reg.get("id"), reg.get("usuario"), msg)
                             api.marcar(reg["id"], "ok", "creado por API: " + msg,
-                                       usuario=str(reg.get("usuario", "")))
+                                       usuario=str(reg.get("usuario", "")), id_ganamos=gid)
                         elif res is False:
                             # El panel dijo con CERTEZA "ese nombre ya existe".
                             # Mandarlo al formulario con el mismo nombre era

@@ -121,6 +121,51 @@ def _parece_json(cuerpo: str) -> bool:
     return t.startswith("{") or t.startswith("[")
 
 
+def extraer_id_ganamos(texto: str) -> int | None:
+    """El id del jugador EN GANAMOS, de la respuesta del POST de creacion.
+
+    Ese id es lo que despues necesita ejecutar_cargas.py para depositar
+    (POST /api/agent_admin/user/{id}/payment/). Guardarlo al crear corta la
+    dependencia del sync: sin esto, hasta que sync_usuarios no espeje al
+    jugador no habia id y las fichas de una recarga quedaban sin depositar.
+
+    Es defensiva a proposito: no se sabe la forma EXACTA del cuerpo del panel,
+    asi que busca el id en los lugares habituales (result.id, id, user.id,
+    data.id). Si no lo encuentra, devuelve None y el flujo sigue como antes
+    (cae al id del espejo). Nunca inventa: un id equivocado depositaria en la
+    cuenta de OTRO jugador.
+    """
+    t = (texto or "").strip()
+    if not _parece_json(t):
+        return None
+    try:
+        d = json.loads(t)
+    except Exception:
+        return None
+    if not isinstance(d, dict):
+        return None
+
+    # Los contenedores donde el panel suele meter el objeto del usuario.
+    candidatos = [d]
+    for clave in ("result", "user", "data", "player", "usuario"):
+        v = d.get(clave)
+        if isinstance(v, dict):
+            candidatos.append(v)
+
+    for obj in candidatos:
+        for clave in ("id", "user_id", "userId"):
+            v = obj.get(clave)
+            # Solo un entero positivo real: un "id" que venga como objeto, lista
+            # o string no numerico no es el id de ganamos.
+            if isinstance(v, bool):
+                continue
+            if isinstance(v, int) and v > 0:
+                return v
+            if isinstance(v, str) and v.isdigit() and int(v) > 0:
+                return int(v)
+    return None
+
+
 def render_cuerpo(plantilla: dict, reg: dict) -> str:
     """Rellena la plantilla con los datos de ESTE registro.
 

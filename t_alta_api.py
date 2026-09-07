@@ -161,5 +161,19 @@ chequear("redirect pero el cuerpo dice 'already exist' = renombrar (False)", r i
 r, _ = A.evaluar_respuesta(200, '{"status":0,"result":{"id":9}}', redirected=False)
 chequear("sin redirect, 2xx positivo sigue = creado", r is True)
 
+# ---------------------------------------------------------------------------
+print("\n=== Extraer el id de ganamos de la respuesta ===")
+
+chequear("result.id", A.extraer_id_ganamos('{"status":0,"result":{"id":98765,"username":"x"}}') == 98765)
+chequear("id en la raiz", A.extraer_id_ganamos('{"id":42,"username":"x"}') == 42)
+chequear("user.id", A.extraer_id_ganamos('{"user":{"id":"7001"}}') == 7001)
+chequear("id como string numerico", A.extraer_id_ganamos('{"result":{"id":"12345"}}') == 12345)
+chequear("sin id -> None", A.extraer_id_ganamos('{"status":0,"result":{"username":"x"}}') is None)
+chequear("cuerpo no JSON -> None", A.extraer_id_ganamos('creado ok') is None)
+chequear("cuerpo vacio -> None", A.extraer_id_ganamos('') is None)
+chequear("id booleano no cuenta", A.extraer_id_ganamos('{"id":true}') is None)
+chequear("id cero no cuenta", A.extraer_id_ganamos('{"id":0}') is None)
+chequear("HTML no rompe", A.extraer_id_ganamos('<html>login</html>') is None)
+
 print(f"\n---------------------------------------\n{ok} OK, {fail} fallas")
 sys.exit(1 if fail else 0)
