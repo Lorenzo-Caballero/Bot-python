@@ -1436,8 +1436,18 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
     if not items:
         return salida
 
+    # PAGINA FRESCA por lote, no la del formulario. La page principal queda
+    # abierta horas y el tab se puede degradar (SPA navegando solo, tab
+    # crasheado en headless): un evaluate sobre esa pagina zombie NO VUELVE
+    # NUNCA y el loop entero queda mudo -- paso el 6/9: dos altas perfectas y
+    # despues silencio total. Abrir un tab nuevo (~1s, misma sesion via el
+    # contexto), navegar al panel, disparar el lote y cerrarlo elimina el
+    # estado viejo de la ecuacion. El watchdog queda como ultima red.
+    pagina_lote = None
     try:
-        respuestas = page.evaluate(_JS_LOTE, {
+        pagina_lote = page.context.new_page()
+        pagina_lote.goto(PANEL_RAIZ, wait_until="domcontentloaded", timeout=15_000)
+        respuestas = pagina_lote.evaluate(_JS_LOTE, {
             "items": items,
             "conc": ALTA_CONCURRENCIA,
             "deadline_ms": ALTA_LOTE_DEADLINE_MS,
@@ -1447,6 +1457,12 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
         # da nada por creado: todos caen al formulario.
         log.warning("  fast-path: el lote por fetch fallo entero (%s); al formulario", e)
         return {reg["id"]: (None, f"fetch fallo: {e}") for reg in regs}
+    finally:
+        if pagina_lote is not None:
+            try:
+                pagina_lote.close()
+            except Exception:
+                pass
 
     for r in respuestas or []:
         reg = porid.get(r.get("i"))
