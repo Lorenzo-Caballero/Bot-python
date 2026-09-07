@@ -25,7 +25,15 @@ services:
     init: true
     volumes:
       - ./datos:/datos
-    command: ["python", "/app/bot_crear_jugador.py", "--headless", "--con-fichas"]
+    # SIN --con-fichas (6/9/2026). Las cargas de saldo las ejecuta el colector
+    # del VPS (ejecutar_cargas.py, cron cada minuto, un POST a la API) desde
+    # que el camino por listado de bot_cargar_fichas quedo obsoleto (13 cargas
+    # contra 28 errores). Tenerlo TAMBIEN aca era redundante y ademas colgaba
+    # las altas: una accion trabada en fichas quema minutos en el mismo hilo
+    # del loop, y el jugador del registro paga la espera. Este bot hace UNA
+    # cosa: altas. Si algun dia hay que correr fichas a mano:
+    #   docker compose run --rm creador python /app/bot_crear_jugador.py --headless --con-fichas --once
+    command: ["python", "/app/bot_crear_jugador.py", "--headless"]
     logging:
       driver: json-file
       options:
