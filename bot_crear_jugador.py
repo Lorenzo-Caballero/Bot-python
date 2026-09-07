@@ -1354,7 +1354,13 @@ async (payload) => {
       });
       let t = '';
       try { t = await r.text(); } catch (e) {}
-      out.push({ i: it.i, status: r.status, text: (t || '').slice(0, 600) });
+      // redirected + url final: ESTE panel responde 307 al POST de creacion y
+      // redirige a la lista de usuarios (crea y manda a ver). fetch sigue el
+      // redirect, asi que r.status/r.text son los del DESTINO; r.redirected y
+      // r.url dicen que hubo redirect y a donde. Python lo usa para distinguir
+      // "creado (redirijio a /users)" de "sesion caida (redirijio al login)".
+      out.push({ i: it.i, status: r.status, text: (t || '').slice(0, 600),
+                 redirected: !!r.redirected, finalUrl: (r.url || '').slice(0, 200) });
     } catch (e) {
       // status 0 = ni siquiera salio (red, timeout, lo que sea): Python lo
       // trata como 'no se sabe' y lo manda al formulario.
@@ -1447,16 +1453,20 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
             continue
         st = int(r.get("status", 0))
         txt = r.get("text", "")
-        res, msg = alta_api.evaluar_respuesta(st, txt)
-        # El status y el cuerpo CRUDOS del panel, siempre. Es la unica forma de
-        # entender por que el fast-path juzga 'creado' / 'renombrar' / 'dudoso'
-        # sin adivinar: si cae al formulario cada vez (alta lenta), aca esta el
-        # motivo exacto -- que devuelve realmente el POST de creacion.
+        redir = bool(r.get("redirected"))
+        final_url = str(r.get("finalUrl", ""))
+        res, msg = alta_api.evaluar_respuesta(st, txt, redirected=redir, url_final=final_url)
+        # El status, el redirect y el cuerpo CRUDOS del panel, siempre. Es la
+        # unica forma de entender por que el fast-path juzga 'creado' /
+        # 'renombrar' / 'dudoso' sin adivinar: si cae al formulario cada vez
+        # (alta lenta), aca esta el motivo exacto -- que devuelve el panel.
         veredicto = ("creado" if res is True else
                      "renombrar" if res is False else "al formulario")
-        log.info("  fast-path %s / %s: HTTP %s -> %s | cuerpo: %s",
-                 reg.get("id"), reg.get("usuario"), st, veredicto,
-                 (txt or "").replace("\n", " ")[:200])
+        log.info("  fast-path %s / %s: HTTP %s%s -> %s | %s",
+                 reg.get("id"), reg.get("usuario"), st,
+                 (" redir->" + final_url[:60]) if redir else "",
+                 veredicto,
+                 msg if res is not None else ("cuerpo: " + (txt or "").replace("\n", " ")[:160]))
         salida[reg["id"]] = (res, msg)
     # Cualquier item sin respuesta (no deberia pasar) -> al formulario.
     for reg in regs:

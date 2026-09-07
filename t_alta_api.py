@@ -135,5 +135,31 @@ r, _ = A.evaluar_respuesta(400, '{"error":"password too short"}')
 chequear("400 por OTRA cosa (no nombre) = None, no False",
          r is None, "un 400 que no es 'ya existe' no se renombra a ciegas")
 
+# ---------------------------------------------------------------------------
+print("\n=== El REDIRECT del panel (307 al crear) ===")
+# Este panel responde 307 al POST de creacion y redirige a la lista: fetch lo
+# sigue, y el destino es lo que hay que juzgar. Es la causa por la que el
+# fast-path parecia no crear nada (todo caia al formulario, ~30s por alta).
+
+r, _ = A.evaluar_respuesta(200, "<html>lista de usuarios</html>",
+                           redirected=True, url_final="https://agents.ganamosonline.com/users/all")
+chequear("redirect a /users/all = creado", r is True)
+
+r, _ = A.evaluar_respuesta(200, "<html>login</html>",
+                           redirected=True, url_final="https://agents.ganamosonline.com/")
+chequear("redirect a la RAIZ (login) = None (sesion caida)", r is None)
+
+r, _ = A.evaluar_respuesta(200, "<html></html>",
+                           redirected=True, url_final="https://agents.ganamosonline.com/login")
+chequear("redirect a /login = None", r is None)
+
+r, _ = A.evaluar_respuesta(200, '{"error_message":"already exist"}',
+                           redirected=True, url_final="https://agents.ganamosonline.com/users/all")
+chequear("redirect pero el cuerpo dice 'already exist' = renombrar (False)", r is False)
+
+# Sin redirect, el 2xx JSON de siempre sigue mandando (no rompe nada).
+r, _ = A.evaluar_respuesta(200, '{"status":0,"result":{"id":9}}', redirected=False)
+chequear("sin redirect, 2xx positivo sigue = creado", r is True)
+
 print(f"\n---------------------------------------\n{ok} OK, {fail} fallas")
 sys.exit(1 if fail else 0)

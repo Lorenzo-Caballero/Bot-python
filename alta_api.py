@@ -148,11 +148,29 @@ def render_cuerpo(plantilla: dict, reg: dict) -> str:
 _RX_YA_EXISTE = re.compile(r"already\s*exist|ya\s*existe|username.*tak|exists", re.I)
 
 
-def evaluar_respuesta(status: int, texto: str) -> tuple[bool | None, str]:
+# Marcas de una URL de LOGIN del panel: el volantazo por sesion caida. El
+# login vive en la RAIZ, asi que ni "login" aparece siempre -- por eso tambien
+# se trata la raiz pelada (sin path de seccion) como login.
+_RX_LOGIN = re.compile(r"login|signin|sign-in|auth|iniciar", re.I)
+
+
+def _es_url_login(url: str) -> bool:
+    u = (url or "").strip().lower()
+    if u == "":
+        return False
+    if _RX_LOGIN.search(u):
+        return True
+    # Raiz pelada: https://host  o  https://host/  (sin seccion) = el login.
+    return bool(re.match(r"^https?://[^/]+/?(\?.*)?$", u))
+
+
+def evaluar_respuesta(status: int, texto: str,
+                      redirected: bool = False, url_final: str = "") -> tuple[bool | None, str]:
     """Que hacer con la respuesta del POST de creacion.
 
     Devuelve (resultado, detalle):
-      True  -> creado. SOLO con 2xx y una señal POSITIVA en el cuerpo.
+      True  -> creado. Con 2xx y señal POSITIVA en el cuerpo, o con un redirect
+               del panel a una pagina interna (ver abajo).
       False -> rechazado por nombre ya existente: hay que renombrar (lo hace
                la cola). Volver a mandar el MISMO nombre no sirve.
       None  -> no se sabe: 5xx, timeout, un cuerpo que no se entiende. El que
@@ -161,7 +179,15 @@ def evaluar_respuesta(status: int, texto: str) -> tuple[bool | None, str]:
     La regla de oro es la misma del formulario: ante la duda, NUNCA 'creado'.
     Un falso 'creado' entrega credenciales de una cuenta que no existe.
 
-    ESTA plataforma reporta errores DENTRO de un HTTP 2xx, con el sobre
+    EL REDIRECT (la razon de que el fast-path pareciera no crear nada): este
+    panel responde 307 al POST de creacion y REDIRIGE a la lista de usuarios
+    (crea y manda a ver). fetch sigue el redirect, asi que el status/cuerpo que
+    llegan son los del DESTINO -- tipicamente HTML de la lista, que sin esta
+    logica se confundia con la pagina de login y caia al formulario CADA VEZ
+    (altas de 30s en vez de 1s). Con `redirected` y `url_final` se distingue:
+    redirijio a una pagina interna del panel = creado; al login = sesion caida.
+
+    ESTA plataforma tambien reporta errores DENTRO de un HTTP 2xx, con el sobre
     {"status":N,"error_message":"..."} — igual que el deposito del colector,
     que hace raise_for_status() y DESPUES chequea status != 0. Por eso un 2xx
     pelado no alcanza: sin señal positiva (status==0, success:true o un
@@ -169,6 +195,19 @@ def evaluar_respuesta(status: int, texto: str) -> tuple[bool | None, str]:
     """
     t = (texto or "")
     tl = t.lower()
+
+    # 1) El redirect del panel manda sobre el status/cuerpo del destino. Un
+    #    error DURO igual gana (el destino podria ser una pagina de error), pero
+    #    el caso normal -- redirijio a la lista tras crear -- es 'creado'.
+    if redirected and url_final:
+        if _es_url_login(url_final):
+            return None, f"redirijio al login (sesion caida): {url_final[:80]}"
+        # Un 'ya existe' puede venir igual con redirect: respetarlo.
+        if _RX_YA_EXISTE.search(t):
+            return False, "nombre ya existente (con redirect)"
+        # Redirect a una pagina interna del panel = el 'creado, anda a ver la
+        # lista'. Es la señal de exito de ESTE panel.
+        return True, f"creado (el panel redirijio a {url_final[:80]})"
 
     if 200 <= status < 300:
         cuerpo = t.lstrip()
