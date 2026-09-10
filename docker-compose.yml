@@ -1,3 +1,13 @@
+# REGLA (aprendida el 7/9/2026 y RE-aprendida el 10/9): si renombras o migras
+# un servicio de aca, corre `docker compose down` del proyecto viejo ANTES del
+# `up` del nuevo. Si no, el contenedor viejo queda huerfano con su
+# restart=unless-stopped: --remove-orphans no lo ve si era de otro proyecto,
+# ningun deploy futuro lo toca, y sigue vivo compitiendo por la cola de altas
+# (asi paso con altas-ganamoscrm: cada alta caia al azar en el bot nuevo, 1s,
+# o en el viejo con la sesion rota, minutos). NUNCA puede haber dos
+# contenedores sondeando la misma cola. deploy-bot.sh neutraliza ese nombre
+# conocido y avisa de cualquier otro sospechoso; para matar uno a mano:
+#   docker update --restart=no <nombre> && docker stop <nombre>
 services:
   # Sondea las dos colas de la API con UN SOLO navegador:
   #   - altas de jugadores  -> llena el formulario "Crear jugador"

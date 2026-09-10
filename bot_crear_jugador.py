@@ -124,6 +124,17 @@ except ValueError:
 DEPOSITA_ON = os.environ.get("ALTA_DEPOSITA", "1").strip().lower() not in (
     "0", "false", "no", "off", "")
 
+# Techo (segundos) de UNA pasada de depositos. La pasada corre en el MISMO
+# hilo que las altas: con backlog en acciones_saldo (o el panel colgando
+# sockets en su timeout de 45s), una pasada entera de 20 dejaba el poll de
+# altas preso decenas de segundos -- o disparaba el watchdog con acciones
+# reclamadas (10/9/2026). Lo que no entra en el techo se LIBERA (vuelve a
+# 'pendiente') y la proxima pasada sigue drenando: las altas mandan.
+try:
+    FICHAS_PASADA_MAX_SEG = max(5, int(os.environ.get("FICHAS_PASADA_MAX_SEG", "25")))
+except ValueError:
+    FICHAS_PASADA_MAX_SEG = 25
+
 # Timeout por fetch (ms) y techo de tiempo del lote entero. El page.evaluate
 # que dispara el pool es BLOQUEANTE y Playwright no le pone timeout: si el
 # panel deja sockets colgados, sin estos topes el loop de altas se congela
@@ -148,6 +159,23 @@ try:
     MAX_FORM_POR_VUELTA = max(1, int(os.environ.get("ALTA_MAX_FORM", "8")))
 except ValueError:
     MAX_FORM_POR_VUELTA = 8
+
+
+# ---------------------------------------------------------------------------
+# Latido del watchdog (el hilo _watchdog del main lo vigila).
+#
+# Es GLOBAL para que las pasadas largas pero sanas -- el lote del fast-path,
+# los depositos de fichas, el triage -- puedan latir entre item e item. Cada
+# item esta acotado por su propio timeout (fetch 15s, deposito 45s), asi que
+# un latido por item conserva la garantia del watchdog (un cuelgue de verdad
+# no late nunca) y elimina su falso positivo: el 10/9/2026 una pasada
+# legitima de mas de 90s disparaba os._exit con hasta 40 altas reclamadas,
+# que quedaban 'procesando' hasta el rescate de zombies, 15 minutos despues.
+WD_LATIDO = [time.monotonic()]
+
+
+def _latir() -> None:
+    WD_LATIDO[0] = time.monotonic()
 
 
 def cargar_plantilla() -> dict | None:
@@ -760,6 +788,24 @@ def login_automatico(page) -> bool:
                   "PANEL_USER/PANEL_PASS en el .env")
         return False
 
+    if _login_con(page, user, clave):
+        return True
+
+    # Las del CRM tienen PRECEDENCIA, y si estan mal cargadas (un typo en
+    # Configuracion -> Panel de agentes) el fallback por excepcion no salta:
+    # el login simplemente falla. Sin este reintento, el bot quedaba en
+    # crash-loop infinito (login fallido -> exit -> Docker lo relanza ->
+    # mismo login) aunque el .env tuviera las credenciales buenas.
+    if (user, clave) != (PANEL_USER, PANEL_PASS) and PANEL_USER and PANEL_PASS:
+        log.warning("Las credenciales del CRM no entraron; reintento con las "
+                    "del .env. Corregi Configuracion -> Panel de agentes en el "
+                    "CRM (o vacia esos campos para volver al .env).")
+        return _login_con(page, PANEL_USER, PANEL_PASS)
+    return False
+
+
+def _login_con(page, user: str, clave: str) -> bool:
+    """UN intento de login con estas credenciales. False si no entro."""
     log.info("Logueando como %s ...", user)
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
@@ -1453,7 +1499,7 @@ def _mismo_endpoint(a: str, b: str) -> bool:
     return na == nb
 
 
-def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
+def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> tuple[dict, list]:
     """Crea jugadores por la API del panel usando el APIRequestContext de
     Playwright (page.context.request), NO page.evaluate.
 
@@ -1474,7 +1520,16 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
     cuelgue.
 
     Secuencial: cada POST es ~300ms-1s. Un lote de N tarda N*eso, sin colgarse.
-    Devuelve {id_reg: (True|False|None, msg)}. No marca ni toca la cola.
+    El lote ENTERO esta acotado por ALTA_LOTE_DEADLINE_MS: esa proteccion
+    existia en el pool viejo de page.evaluate y la migracion a context.request
+    la perdio -- sin ella, 40 items colgando cada uno en su timeout de 15s son
+    10 minutos sin sondear altas nuevas (y antes del arreglo del latido, un
+    os._exit del watchdog con el lote entero reclamado). Lo que no llega a
+    intentarse NO baja al formulario: vuelve en `sin_intentar` para que el
+    caller lo LIBERE y la proxima vuelta lo retome.
+
+    Devuelve ({id_reg: (True|False|None, msg, gid)}, sin_intentar).
+    No marca ni toca la cola.
     """
     import alta_api
 
@@ -1483,8 +1538,19 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
     metodo = (plantilla.get("metodo") or "POST").upper()
     content_type = plantilla.get("content_type", "application/json")
     salida = {}
+    sin_intentar: list[dict] = []
+    t0 = time.monotonic()
 
-    for reg in regs:
+    for i, reg in enumerate(regs):
+        # Cada item esta acotado por su timeout: un latido por item mantiene
+        # al watchdog cazando cuelgues DE VERDAD, sin matar lotes sanos.
+        _latir()
+        if (time.monotonic() - t0) * 1000 > ALTA_LOTE_DEADLINE_MS:
+            sin_intentar = list(regs[i:])
+            log.warning("  fast-path: deadline del lote (%.0fs): %d alta(s) "
+                        "vuelven a la cola para la vuelta que viene",
+                        ALTA_LOTE_DEADLINE_MS / 1000, len(sin_intentar))
+            break
         try:
             datos = completar_datos(reg)
             # Manda EXACTAMENTE lo mismo que tiparia el formulario.
@@ -1531,7 +1597,7 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> dict:
                  msg if res is not None else ("cuerpo: " + (txt or "").replace("\n", " ")[:160]))
         salida[reg["id"]] = (res, msg, gid)
 
-    return salida
+    return salida, sin_intentar
 
 
 # ---------------------------------------------------------------------------
@@ -1600,7 +1666,25 @@ def depositar_fichas_pendientes(page, api) -> int:
                       id_accion, estado, e)
 
     hechas = 0
-    for a in acciones:
+    t0 = time.monotonic()
+    for i, a in enumerate(acciones):
+        # Cada deposito esta acotado (POST 45s + marcar 20s): latir por item
+        # evita que una pasada legitima dispare el watchdog (10/9/2026).
+        _latir()
+        # Techo de la pasada: las altas mandan. Lo no intentado se libera
+        # (vuelve a 'pendiente', SOLO los propios) y la proxima pasada sigue.
+        if time.monotonic() - t0 > FICHAS_PASADA_MAX_SEG:
+            resto = [int(x.get("id") or 0) for x in acciones[i:]]
+            log.info("fichas: techo de pasada (%ss): %d accion(es) liberadas "
+                     "para la proxima", FICHAS_PASADA_MAX_SEG, len(resto))
+            try:
+                resp = api.s.post(url_acc, params={"accion": "liberar"},
+                                  json={"ids": resto}, timeout=20)
+                resp.raise_for_status()
+            except Exception as e:
+                log.error("fichas: no pude liberar el resto (%s); van a caer "
+                          "en 'revisar' a los 15 min", e)
+            break
         idA   = int(a.get("id") or 0)
         tipo  = (a.get("tipo") or "").strip()
         usr   = (a.get("usuario") or "").strip()
@@ -2096,12 +2180,12 @@ def main() -> int:
             _wd_timeout = max(30, int(os.environ.get("ALTA_WATCHDOG_SEG", "90")))
         except ValueError:
             _wd_timeout = 90
-        _wd_latido = [time.monotonic()]
+        _latir()   # el arranque cuenta como primer latido
 
         def _watchdog():
             while True:
                 time.sleep(15)
-                quieto = time.monotonic() - _wd_latido[0]
+                quieto = time.monotonic() - WD_LATIDO[0]
                 if quieto > _wd_timeout:
                     log.error("WATCHDOG: el loop lleva %.0fs sin avanzar "
                               "(page.evaluate colgado?). Reinicio el proceso para "
@@ -2115,7 +2199,7 @@ def main() -> int:
         aprendido: dict = {}     # se llena cuando el formulario ensena la plantilla
         try:
             while True:
-                _wd_latido[0] = time.monotonic()   # "sigo vivo" para el watchdog
+                _latir()   # "sigo vivo" para el watchdog
                 try:
                     lote = api.pendientes(args.lote)
                 except ErrorApi as e:
@@ -2150,10 +2234,23 @@ def main() -> int:
                 # En --dry-run NO se dispara: el fetch crearia cuentas de verdad.
                 # Ahi todo baja al formulario, que si respeta dry_run.
                 if plantilla and lote and not args.dry_run:
-                    resultados = crear_lote_por_fetch(page, plantilla, lote)
+                    resultados, sin_intentar = crear_lote_por_fetch(page, plantilla, lote)
+                    # Lo que el deadline del lote dejo sin intentar vuelve a la
+                    # cola YA (liberar los propios): mandarlo al formulario
+                    # seria pagar 35-50s por alta justo cuando el panel viene
+                    # lento, y dejarlo 'procesando' lo condena al rescate de
+                    # zombies de 15 minutos.
+                    if sin_intentar:
+                        try:
+                            api.liberar(ids=[r["id"] for r in sin_intentar])
+                        except Exception as e:
+                            log.warning("  no pude liberar las del deadline: %s", e)
+                        _fuera = {r["id"] for r in sin_intentar}
+                        lote = [r for r in lote if r["id"] not in _fuera]
                     restantes = []
                     creados = 0
                     for reg in lote:
+                        _latir()   # el triage tambien avanza de a un item acotado
                         res, msg, gid = resultados.get(reg["id"], (None, "sin respuesta", None))
                         if res is True:
                             creados += 1
@@ -2217,7 +2314,7 @@ def main() -> int:
                         log.warning("  no pude liberar el excedente de formulario: %s", e)
 
                 for reg in lote:
-                    _wd_latido[0] = time.monotonic()   # cada alta cuenta como avance
+                    _latir()   # cada alta cuenta como avance
                     etiqueta = f"{reg.get('id')} / {reg.get('usuario')}"
                     log.info("Creando jugador %s", etiqueta)
                     try:
