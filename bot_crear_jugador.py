@@ -717,18 +717,55 @@ def es_pantalla_login(page) -> bool:
         return False
 
 
+def credenciales_del_panel() -> tuple[str, str]:
+    """Con que usuario/contraseña entrar al panel.
+
+    PRIMERO las que el cliente cargo en el CRM (Configuracion -> Panel de
+    agentes, servidas por acciones_cola.php?accion=panel_credenciales): asi
+    un cambio de contraseña del panel se resuelve desde el CRM, sin entrar
+    al VPS a editar este .env. Si no hay nada cargado -- o la API no
+    contesta -- se cae a PANEL_USER/PANEL_PASS del .env, que es el
+    comportamiento de siempre.
+
+    Se consulta EN CADA login (no se cachea): el login es poco frecuente y
+    es justo el momento en que una contraseña recien cambiada importa.
+    """
+    api_url = os.environ.get("API_URL", "")
+    api_key = os.environ.get("API_KEY", "")
+    if api_url and api_key:
+        try:
+            r = requests.get(
+                _url_acciones(api_url),
+                params={"accion": "panel_credenciales"},
+                headers={"X-API-Key": api_key, "User-Agent": UA},
+                timeout=10,
+            )
+            if r.ok:
+                j = r.json() or {}
+                u = (j.get("user") or "").strip()
+                c = j.get("pass") or ""
+                if u and c:
+                    log.info("Credenciales del panel: las del CRM (usuario %s)", u)
+                    return u, c
+        except Exception as e:
+            log.warning("No pude pedir las credenciales al CRM (%s); uso las del .env", e)
+    return PANEL_USER, PANEL_PASS
+
+
 def login_automatico(page) -> bool:
-    """Loguea con PANEL_USER/PANEL_PASS del .env. False si no pudo."""
-    if not PANEL_USER or not PANEL_PASS:
-        log.error("Faltan PANEL_USER / PANEL_PASS en el .env")
+    """Loguea con las credenciales del CRM o, si no hay, las del .env."""
+    user, clave = credenciales_del_panel()
+    if not user or not clave:
+        log.error("Sin credenciales del panel: ni cargadas en el CRM ni "
+                  "PANEL_USER/PANEL_PASS en el .env")
         return False
 
-    log.info("Logueando como %s ...", PANEL_USER)
+    log.info("Logueando como %s ...", user)
     page.goto(LOGIN_URL, wait_until="domcontentloaded")
 
     try:
-        tipear(page, SEL_LOGIN["usuario"] + " >> nth=0", PANEL_USER)
-        tipear(page, SEL_LOGIN["password"] + " >> nth=0", PANEL_PASS)
+        tipear(page, SEL_LOGIN["usuario"] + " >> nth=0", user)
+        tipear(page, SEL_LOGIN["password"] + " >> nth=0", clave)
     except (PWError, PWTimeout) as e:
         page.screenshot(path=str(SHOTS / "login_sin_campos.png"))
         log.error("No encontre los campos del login (%s). Mira capturas/login_sin_campos.png", e)
@@ -1650,14 +1687,13 @@ def modo_login(headless: bool = False, mantener: bool = False) -> int:
         page = ctx.new_page()
         page.set_default_timeout(15_000)
 
-        automatico = bool(PANEL_USER and PANEL_PASS) and login_automatico(page)
+        # login_automatico ya resuelve de donde salen las credenciales (CRM
+        # primero, .env de respaldo) y loguea claro si no hay ningunas.
+        automatico = login_automatico(page)
 
         if not automatico:
-            if PANEL_USER and PANEL_PASS:
-                log.warning("El login automatico fallo, seguilo a mano en la ventana")
-            else:
-                log.info("No hay PANEL_USER/PANEL_PASS en el .env, login manual")
-                page.goto(LOGIN_URL)
+            log.warning("El login automatico no entro, seguilo a mano en la ventana")
+            page.goto(LOGIN_URL)
             if headless:
                 log.error("Sin ventana no podes loguearte a mano. Saca --headless")
                 browser.close()
