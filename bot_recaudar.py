@@ -209,34 +209,56 @@ def _firma_filas(page) -> str:
     return "|".join(j["usuario"] for j in js[:3])
 
 
-def _click_siguiente(page) -> bool:
-    """Clickea la flecha 'siguiente' probando varias formas: el wrapper, con
-    scroll, con force, y por ultimo el svg/span de adentro. El paginador es un
-    SPA quisquilloso -- un solo intento fallaba en silencio."""
-    intentos = []
+def _avanzo_desde(page, antes: str, seg: float = 6.0) -> bool:
+    """True apenas el contenido de las filas cambia respecto de `antes`."""
+    pasos = max(1, int(seg / 0.5))
+    for _ in range(pasos):
+        page.wait_for_timeout(500)
+        if _firma_filas(page) != antes:
+            return True
+    return False
+
+
+def _click_siguiente(page, antes: str) -> bool:
+    """Avanza UNA pagina y CONFIRMA que avanzo. El paginador es un icono SVG
+    de React: un click normal (aun con force) no llega al onClick -- por eso
+    el metodo que manda es dispatch_event('click'), que lanza el evento DOM
+    directo. Se prueban, EN ORDEN y verificando el avance tras cada uno: el
+    dispatch sobre el wrapper y sobre el svg/path, despues force y click de
+    verdad. Devuelve True solo si el contenido REALMENTE cambio."""
+    cands = []                      # (locator, metodo)
     try:
         sel = bot.primer_selector(page, SEL_SIGUIENTE, 4_000)
-        loc = page.locator(sel).first
-        try: loc.scroll_into_view_if_needed(timeout=2_000)
+        w = page.locator(sel).first
+        try: w.scroll_into_view_if_needed(timeout=2_000)
         except Exception: pass
-        intentos.append(("wrapper", loc))
-        intentos.append(("wrapper+force", loc))
+        cands.append((w, "dispatch"))
     except Exception:
-        pass
+        w = None
     for s in SEL_SIGUIENTE_HIJOS:
         try:
             l = page.locator(s).first
             if l.count() > 0:
-                intentos.append(("hijo", l))
+                cands.append((l, "dispatch"))
         except Exception:
             pass
+    if w is not None:
+        cands.append((w, "force"))
+        cands.append((w, "click"))
 
-    for i, (nombre, loc) in enumerate(intentos):
+    for loc, metodo in cands:
         try:
-            loc.click(timeout=4_000, force=("force" in nombre))
-            return True
+            if metodo == "dispatch":
+                loc.dispatch_event("click", timeout=3_000)
+            else:
+                loc.click(timeout=3_000, force=(metodo == "force"))
         except (PWError, PWTimeout):
             continue
+        # Verificar corto entre metodos: si ESTE disparo el cambio, listo; si
+        # no, se prueba el siguiente en vez de rendirse en el primero que no
+        # tiro error (dispatch nunca tira aunque no haga nada).
+        if _avanzo_desde(page, antes, seg=2.5):
+            return True
     return False
 
 
@@ -292,19 +314,11 @@ def saltar_paginas(page, cuantas: int) -> bool:
     """Avanza `cuantas` paginas. False si alguna no avanzo (se quedo sin)."""
     for n in range(cuantas):
         antes = _firma_filas(page)
-
-        def _avanzo() -> bool:
-            for _ in range(16):     # hasta ~8s a que el contenido repinte
-                page.wait_for_timeout(500)
-                if _firma_filas(page) != antes:
-                    return True
-            return False
-
-        # 1) la flecha 'siguiente' (varias formas de click)
-        cambio = _click_siguiente(page) and _avanzo()
+        # 1) la flecha 'siguiente' (dispatch/force/click, verificando avance)
+        cambio = _click_siguiente(page, antes)
         # 2) si no avanzo, plan B: clickear un numero de pagina mas alto
         if not cambio and _click_numero_adelante(page):
-            cambio = _avanzo()
+            cambio = _avanzo_desde(page, antes, seg=6.0)
 
         if not cambio:
             log.warning("la pagina no cambio: no hay mas paginas (o ni la "
