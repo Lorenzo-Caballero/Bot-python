@@ -173,29 +173,49 @@ def _saldos_de_la_pagina(page) -> list[float]:
 
 
 def pagina_actual(page) -> str:
+    """Etiqueta de la pagina, solo para el log. NO se usa para decidir si
+    avanzo: SEL_PAGINA_ACTUAL es el CONTENEDOR de los numeros ('1 2 3 4...'),
+    que dice lo mismo en todas las paginas -- por eso saltar_paginas compara
+    el CONTENIDO de las filas, no esto."""
     try:
         sel = bot.primer_selector(page, SEL_PAGINA_ACTUAL, 5_000)
-        return (page.locator(sel).first.inner_text(timeout=3_000) or "?").strip()
+        return (page.locator(sel).first.inner_text(timeout=3_000) or "?").strip().replace("\n", " ")
     except Exception:
         return "?"
+
+
+def _firma_filas(page) -> str:
+    """Los primeros nombres de la pagina actual, para saber si REALMENTE
+    cambio al pasar de pagina. Es infalible: no depende de como el panel
+    dibuje el paginador (que fue lo que rompio la deteccion por el numero)."""
+    js = jugadores_de_la_pagina(page)
+    return "|".join(j["usuario"] for j in js[:3])
 
 
 def saltar_paginas(page, cuantas: int) -> bool:
     """Avanza `cuantas` paginas. False si alguna no avanzo (se quedo sin)."""
     for n in range(cuantas):
-        antes = pagina_actual(page)
+        antes = _firma_filas(page)
         try:
             sel = bot.primer_selector(page, SEL_SIGUIENTE, 6_000)
             page.locator(sel).first.click(timeout=6_000)
         except (PWError, PWTimeout) as e:
-            log.error("no pude pasar de la pagina %s (%s)", antes, e)
+            log.error("no pude clickear 'siguiente' (%s)", e)
             return False
-        page.wait_for_timeout(1_400)
-        ahora = pagina_actual(page)
-        if ahora == antes:
-            log.warning("la pagina no cambio (%s): no hay mas paginas", antes)
+        # Esperar a que el contenido CAMBIE (no solo un timeout fijo): el panel
+        # tarda distinto cada vez, y leer antes de que repinte daria un falso
+        # "no cambio". Hasta ~6s.
+        cambio = False
+        for _ in range(12):
+            page.wait_for_timeout(500)
+            if _firma_filas(page) != antes:
+                cambio = True
+                break
+        if not cambio:
+            log.warning("la pagina no cambio: no hay mas paginas (o el boton "
+                        "'siguiente' no respondio)")
             return False
-        log.info("  pagina %s -> %s", antes, ahora)
+        log.info("  pagina -> %s", pagina_actual(page))
     return True
 
 
