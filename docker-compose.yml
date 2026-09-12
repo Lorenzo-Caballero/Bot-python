@@ -77,3 +77,30 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # RECAUDADOR: escucha la cola del CRM (recaudar_cola.php) y retira el saldo
+  # de jugadores inactivos desde el panel. Apagado por defecto (profile
+  # "recaudar"): mueve plata, se prende a proposito.
+  #   docker compose --profile recaudar up -d recaudador
+  # Comparte la imagen y el .env; sesion del panel APARTE (./datos-recaudar)
+  # para no pelear el navegador con el creador de altas.
+  recaudador:
+    build:
+      context: .
+      args:
+        GIT_HASH: "${GIT_HASH:-desconocido}"
+    image: ganamos-bot:latest
+    container_name: ganamos-bot-recaudador
+    restart: unless-stopped
+    env_file: .env
+    shm_size: "1gb"
+    init: true
+    volumes:
+      - ./datos-recaudar:/datos
+    command: ["python", "/app/bot_recaudar.py", "--demonio", "--headless"]
+    profiles: ["recaudar"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

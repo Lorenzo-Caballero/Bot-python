@@ -314,7 +314,13 @@ def retirar_uno(page, indice: int, usuario: str, dry: bool) -> tuple[bool, str]:
     return True, "retirado"
 
 
-def recaudar(args) -> int:
+def recaudar(args, reporte: dict | None = None) -> int:
+    # `reporte` (opcional): el demonio pasa un dict y esta funcion lo llena con
+    # {objetivo, retirados, total, fallados, detalle} para reportarlo al CRM.
+    # main() (uso por consola) pasa None y solo mira el log.
+    if reporte is None:
+        reporte = {}
+    reporte.setdefault("detalle", [])
     with sync_playwright() as p:
         browser, ctx = bot.nuevo_contexto(p, headless=args.headless, con_sesion=True)
         page = ctx.new_page()
@@ -363,6 +369,8 @@ def recaudar(args) -> int:
 
         objetivo = [j for j in candidatos if j["usuario"] in permitidos][: args.max]
         total = sum(j["saldo"] for j in objetivo)
+        reporte["objetivo"] = [{"usuario": j["usuario"], "saldo": j["saldo"]} for j in objetivo]
+        reporte["total_objetivo"] = total
 
         log.info("")
         log.info("=== %s: %d jugador(es), $%.2f en total ===",
@@ -403,8 +411,15 @@ def recaudar(args) -> int:
             else:
                 fallados += 1
                 log.warning("   FALLO %s", detalle)
+            reporte["detalle"].append({
+                "usuario": j["usuario"], "saldo": fila["saldo"],
+                "ok": ok, "detalle": detalle,
+            })
             time.sleep(1.0)
 
+        reporte["retirados"] = hechos
+        reporte["total"] = recaudado
+        reporte["fallados"] = fallados
         log.info("")
         log.info("=== Listo: %d retirado(s) por $%.2f, %d fallado(s) ===",
                  hechos, recaudado, fallados)
@@ -412,9 +427,87 @@ def recaudar(args) -> int:
         return 0 if fallados == 0 else 1
 
 
+def _url_cola(api_url: str) -> str:
+    """De .../altas_cola.php (o cualquier .php del API) -> .../recaudar_cola.php."""
+    return api_url.split("?")[0].rsplit("/", 1)[0] + "/recaudar_cola.php"
+
+
+def _ns(**kw):
+    """Un objeto tipo argparse liviano, para reusar recaudar() desde el demonio."""
+    from types import SimpleNamespace
+    return SimpleNamespace(**kw)
+
+
+def demonio(headless: bool, poll: int) -> int:
+    """Pollea la cola del CRM (recaudar_cola.php) y ejecuta cada pedido.
+
+    El agente toca «Recaudar» en el CRM -> se encola una fila -> este loop la
+    reclama y corre recaudar() con esos topes, reportando el resultado. La
+    cola ya garantiza UNA a la vez (accion=pendientes no entrega otra mientras
+    haya una en 'procesando'), asi que no hay dos recaudaciones pisandose.
+    Best-effort de punta a punta: un pedido que explota se marca 'error' con
+    el motivo, y el loop sigue con el siguiente.
+    """
+    api_url = os.environ.get("API_URL", "")
+    api_key = os.environ.get("API_KEY", "")
+    if not api_url or not api_key:
+        log.error("faltan API_URL/API_KEY en el .env: el demonio no puede consultar la cola")
+        return 1
+    url = _url_cola(api_url)
+    s = requests.Session()
+    s.headers.update({"X-API-Key": api_key, "User-Agent": bot.UA})
+    log.info("demonio de recaudacion escuchando %s (cada %ds)", url, poll)
+
+    while True:
+        pedido = None
+        try:
+            r = s.get(url, params={"accion": "pendientes"}, timeout=20)
+            r.raise_for_status()
+            pedido = (r.json() or {}).get("datos")
+        except Exception as e:
+            log.error("no pude leer la cola (%s): %s", url, e)
+
+        if not pedido:
+            time.sleep(poll)
+            continue
+
+        pid = int(pedido["id"])
+        log.info("== pedido #%d: %s dias=%s saltar=%s tope=%s min=%s (por %s) ==",
+                 pid, "REAL" if not pedido["dry_run"] else "PRUEBA",
+                 pedido["dias"], pedido["saltar"], pedido["tope"],
+                 pedido["min_saldo"], pedido.get("pedido_por", "?"))
+
+        reporte: dict = {}
+        estado, mensaje = "hecha", None
+        try:
+            args = _ns(si=not pedido["dry_run"], dias=pedido["dias"],
+                       saltar=pedido["saltar"], max=pedido["tope"],
+                       min_saldo=pedido["min_saldo"], sin_chequeo=False,
+                       headless=headless)
+            rc = recaudar(args, reporte)
+            if rc != 0 and reporte.get("fallados", 0) > 0:
+                mensaje = f"{reporte.get('fallados')} retiro(s) fallaron"
+        except Exception as e:
+            log.exception("pedido #%d exploto", pid)
+            estado, mensaje = "error", str(e)[:255]
+
+        try:
+            s.post(url, params={"accion": "marcar"},
+                   json={"id": pid, "estado": estado,
+                         "resultado": reporte, "mensaje": mensaje}, timeout=20).raise_for_status()
+            log.info("== pedido #%d -> %s ==", pid, estado)
+        except Exception as e:
+            log.error("no pude marcar el pedido #%d: %s", pid, e)
+        time.sleep(poll)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description="Recauda el saldo de jugadores inactivos desde el panel.")
+    ap.add_argument("--demonio", action="store_true",
+                    help="escucha la cola del CRM y ejecuta los pedidos (para el VPS)")
+    ap.add_argument("--poll", type=int, default=20,
+                    help="cada cuantos segundos revisa la cola, en --demonio (20)")
     ap.add_argument("--si", action="store_true",
                     help="RETIRA DE VERDAD (sin esto es una prueba y no toca nada)")
     ap.add_argument("--dias", type=int, default=30,
@@ -432,6 +525,8 @@ def main() -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
                         datefmt="%H:%M:%S")
+    if args.demonio:
+        return demonio(args.headless, args.poll)
     if args.si and args.sin_chequeo:
         log.warning("=" * 66)
         log.warning("  --si + --sin-chequeo: vas a retirar SIN confirmar que")
