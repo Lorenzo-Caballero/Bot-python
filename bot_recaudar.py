@@ -78,16 +78,25 @@ SEL_PAGINA_ACTUAL = [
     "div > div.paginator-switcher__pages > div",
     ".paginator-switcher__pages > div",
 ]
+# El contenedor de los NUMEROS de pagina. Plan B para avanzar si la flecha no
+# responde: se clickea un numero mas alto que el actual.
+SEL_PAGINAS_CONTENEDOR = [
+    f"{BASE} > div.users-table__paginator-wrapper > div.paginator-switcher > "
+    "div > div.paginator-switcher__pages",
+    ".paginator-switcher__pages",
+]
 SEL_SIGUIENTE = [
     f"{BASE} > div.users-table__paginator-wrapper > div.paginator-switcher > "
     "div > div:nth-child(4)",
     ".paginator-switcher > div > div:nth-child(4)",
 ]
-# El nodo REALMENTE clickeable dentro de la flecha (a veces el div wrapper no
-# toma el click y hay que ir al svg / su span). Se prueban en orden.
+# El nodo REALMENTE clickeable dentro de la flecha (el div wrapper no toma el
+# click; el que responde es el <path> del svg, confirmado sobre el panel el
+# 12/9/2026). Se prueban en orden, del mas especifico al mas general.
 SEL_SIGUIENTE_HIJOS = [
     f"{BASE} > div.users-table__paginator-wrapper > div.paginator-switcher > "
-    "div > div:nth-child(4) > span > span > svg",
+    "div > div:nth-child(4) > span > span > svg > path",
+    ".paginator-switcher > div > div:nth-child(4) svg > path",
     ".paginator-switcher > div > div:nth-child(4) svg",
     ".paginator-switcher > div > div:nth-child(4) span",
 ]
@@ -231,6 +240,36 @@ def _click_siguiente(page) -> bool:
     return False
 
 
+def _click_numero_adelante(page) -> bool:
+    """Plan B cuando la flecha no responde: clickea el numero de pagina mas
+    ALTO que se vea (el de mas a la derecha en el contenedor de paginas), que
+    siempre esta hacia adelante. Avanzar de mas es SEGURO (mas lejos de los
+    que acaban de cargar); nunca retrocede."""
+    try:
+        cont = bot.primer_selector(page, SEL_PAGINAS_CONTENEDOR, 3_000)
+    except Exception:
+        return False
+    nums = page.locator(cont).locator("div, span, button, a")
+    mejor = None
+    mejorN = -1
+    try:
+        for i in range(min(nums.count(), 30)):
+            el = nums.nth(i)
+            t = (el.inner_text(timeout=800) or "").strip()
+            if t.isdigit() and int(t) > mejorN:
+                mejorN, mejor = int(t), el
+    except Exception:
+        pass
+    if mejor is None:
+        return False
+    try:
+        mejor.click(timeout=3_000, force=True)
+        log.info("  (plan B: clickeo pagina %d)", mejorN)
+        return True
+    except (PWError, PWTimeout):
+        return False
+
+
 def _diag_paginador(page) -> None:
     """Cuando no se puede avanzar, deja en el log POR QUE: cuantas filas hay,
     que dice el paginador, y si el boton 'siguiente' siquiera existe. Asi la
@@ -253,22 +292,23 @@ def saltar_paginas(page, cuantas: int) -> bool:
     """Avanza `cuantas` paginas. False si alguna no avanzo (se quedo sin)."""
     for n in range(cuantas):
         antes = _firma_filas(page)
-        if not _click_siguiente(page):
-            log.error("no encontre/pude clickear la flecha 'siguiente'")
-            _diag_paginador(page)
+
+        def _avanzo() -> bool:
+            for _ in range(16):     # hasta ~8s a que el contenido repinte
+                page.wait_for_timeout(500)
+                if _firma_filas(page) != antes:
+                    return True
             return False
-        # Esperar a que el contenido CAMBIE (no solo un timeout fijo): el panel
-        # tarda distinto cada vez, y leer antes de que repinte daria un falso
-        # "no cambio". Hasta ~8s.
-        cambio = False
-        for _ in range(16):
-            page.wait_for_timeout(500)
-            if _firma_filas(page) != antes:
-                cambio = True
-                break
+
+        # 1) la flecha 'siguiente' (varias formas de click)
+        cambio = _click_siguiente(page) and _avanzo()
+        # 2) si no avanzo, plan B: clickear un numero de pagina mas alto
+        if not cambio and _click_numero_adelante(page):
+            cambio = _avanzo()
+
         if not cambio:
-            log.warning("la pagina no cambio: no hay mas paginas (o el boton "
-                        "'siguiente' no respondio)")
+            log.warning("la pagina no cambio: no hay mas paginas (o ni la "
+                        "flecha ni los numeros respondieron)")
             _diag_paginador(page)
             return False
         log.info("  pagina -> %s", pagina_actual(page))
