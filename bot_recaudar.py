@@ -171,6 +171,32 @@ def ordenar_por_saldo(page) -> bool:
     return False
 
 
+def preparar_listado(page, saltar: int) -> bool:
+    """Deja el listado LISTO para leer/retirar: recien cargado, ordenado por
+    saldo de mayor a menor, y en la pagina que toca. Se llama en CADA
+    actualizacion (al arrancar y antes de cada retiro), porque el panel pierde
+    el orden con cualquier cosa -- un retiro, un refresco. Ademas, tras
+    paginar, RE-VERIFICA que la pagina siga descendente y re-aplica el orden
+    una vez si se perdio: '888...188' que quede en '188...888' significaria
+    recaudar al reves. Devuelve False si no pudo dejarlo ordenado y paginado."""
+    page.goto(bot.URL_LISTADO, wait_until="domcontentloaded")
+    page.wait_for_timeout(1_200)
+    if not ordenar_por_saldo(page):
+        return False
+    if saltar and not saltar_paginas(page, saltar):
+        return False
+    # ¿Sigue de mayor a menor despues de paginar? Si no, el orden se cayo al
+    # cambiar de pagina: se re-aplica y se re-saltea UNA vez.
+    saldos = _saldos_de_la_pagina(page)
+    if len(saldos) >= 2 and saldos[0] < saldos[-1]:
+        log.warning("  el orden se perdio al paginar; lo re-aplico")
+        if not ordenar_por_saldo(page):
+            return False
+        if saltar and not saltar_paginas(page, saltar):
+            return False
+    return True
+
+
 def _saldos_de_la_pagina(page) -> list[float]:
     try:
         filas = page.locator(bot.primer_selector(page, SEL_FILAS, 8_000))
@@ -464,15 +490,9 @@ def recaudar(args, reporte: dict | None = None) -> int:
                 return 1
             bot.guardar_sesion(ctx, page)
 
-        page.goto(bot.URL_LISTADO, wait_until="domcontentloaded")
-        page.wait_for_timeout(1_500)
-
-        if not ordenar_por_saldo(page):
-            browser.close()
-            return 1
-        if args.saltar and not saltar_paginas(page, args.saltar):
-            log.error("no pude saltar %d pagina(s): corto para no tocar a los "
-                      "de mas saldo (que son los que acaban de cargar)", args.saltar)
+        if not preparar_listado(page, args.saltar):
+            log.error("no pude dejar el listado ordenado y en la pagina %d+ "
+                      "(corto para no tocar a los de mas saldo)", args.saltar)
             browser.close()
             return 1
 
@@ -522,11 +542,10 @@ def recaudar(args, reporte: dict | None = None) -> int:
         for j in objetivo:
             log.info("-> %s ($%.2f)", j["usuario"], j["saldo"])
             # Cada retiro arranca del listado recien ordenado: el panel pierde
-            # el orden al volver, y los indices de fila cambian con el.
-            page.goto(bot.URL_LISTADO, wait_until="domcontentloaded")
-            page.wait_for_timeout(1_200)
-            if not ordenar_por_saldo(page) or (args.saltar and not saltar_paginas(page, args.saltar)):
-                log.error("   no pude volver a la pagina: corto")
+            # el orden al retirar, y los indices de fila cambian con el. Se
+            # re-ordena y re-verifica (preparar_listado), como al arrancar.
+            if not preparar_listado(page, args.saltar):
+                log.error("   no pude volver a la pagina ordenada: corto")
                 break
             vivos = jugadores_de_la_pagina(page)
             fila = next((v for v in vivos if v["usuario"] == j["usuario"]), None)
