@@ -143,13 +143,34 @@ def _num(txt: str) -> float:
         return 0.0
 
 
+def _disparar_click(loc) -> bool:
+    """Clickea `loc` de la forma que un icono/header de React SI escucha:
+    dispatch_event('click') primero (evento DOM directo, no le importa
+    pointer-events ni overlays), y force/click como respaldo. True si al menos
+    uno no tiro error."""
+    for metodo in ("dispatch", "force", "click"):
+        try:
+            if metodo == "dispatch":
+                loc.dispatch_event("click", timeout=3_000)
+            else:
+                loc.click(timeout=3_000, force=(metodo == "force"))
+            return True
+        except (PWError, PWTimeout):
+            continue
+    return False
+
+
 def ordenar_por_saldo(page) -> bool:
     """Deja el listado ordenado por saldo de MAYOR a MENOR.
 
     El header alterna asc/desc en cada click, asi que no alcanza con clickear:
-    hay que MIRAR como quedo. Se lee el saldo de la primera y la ultima fila y,
-    si quedo ascendente, se clickea otra vez. Sin esto, un dia el bot recauda
-    exactamente al reves de lo que queres.
+    hay que MIRAR como quedo (leyendo la columna SALDO real, no el numero del
+    nombre). Si quedo ascendente, se clickea de nuevo.
+
+    El click va por _disparar_click: el header es un elemento de React y el
+    click 'normal' NO dispara su onClick -- por eso antes 'ordenaba' de mentira
+    (pasaba de casualidad leyendo los numeros de los usuarios) y ahora, leyendo
+    el saldo real, se veia que nunca ordeno. Mismo arreglo que la flecha.
     """
     try:
         sel = bot.primer_selector(page, SEL_ORDEN_SALDO, 10_000)
@@ -157,13 +178,19 @@ def ordenar_por_saldo(page) -> bool:
         log.error("no encuentro el header de saldo (%s)", e)
         return False
 
-    for intento in (1, 2):
-        try:
-            page.locator(sel).first.click(timeout=8_000)
-        except (PWError, PWTimeout) as e:
-            log.error("no pude clickear el orden por saldo: %s", e)
+    header = page.locator(sel).first
+    for intento in (1, 2, 3):
+        antes = _saldos_de_la_pagina(page)
+        if not _disparar_click(header):
+            log.error("no pude clickear el header de saldo")
             return False
-        page.wait_for_timeout(1_200)
+        # Esperar a que la tabla RE-ORDENE (el orden cambia el contenido);
+        # leer antes de eso daria el estado viejo. Hasta ~4s.
+        for _ in range(8):
+            page.wait_for_timeout(500)
+            saldos = _saldos_de_la_pagina(page)
+            if saldos != antes:
+                break
         saldos = _saldos_de_la_pagina(page)
         if len(saldos) < 2:
             return True                      # una sola fila: nada que ordenar
