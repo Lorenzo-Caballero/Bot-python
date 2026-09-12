@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
  && playwright install --with-deps chromium \
  && rm -rf /var/lib/apt/lists/*
 
-COPY bot_crear_jugador.py bot_cargar_fichas.py sync_usuarios.py alta_api.py ./
+COPY bot_crear_jugador.py bot_cargar_fichas.py sync_usuarios.py alta_api.py bot_recaudar.py ./
 
 # La version del codigo horneada EN la imagen. El bot la anuncia al arrancar:
 # es la unica defensa contra el fallo silencioso que ya paso dos veces --
