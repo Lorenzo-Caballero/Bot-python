@@ -83,6 +83,14 @@ SEL_SIGUIENTE = [
     "div > div:nth-child(4)",
     ".paginator-switcher > div > div:nth-child(4)",
 ]
+# El nodo REALMENTE clickeable dentro de la flecha (a veces el div wrapper no
+# toma el click y hay que ir al svg / su span). Se prueban en orden.
+SEL_SIGUIENTE_HIJOS = [
+    f"{BASE} > div.users-table__paginator-wrapper > div.paginator-switcher > "
+    "div > div:nth-child(4) > span > span > svg",
+    ".paginator-switcher > div > div:nth-child(4) svg",
+    ".paginator-switcher > div > div:nth-child(4) span",
+]
 SEL_FILAS = [
     f"{BASE} > div.users-table__table > div.users-table__tbody > div",
     ".users-table__tbody > div",
@@ -192,21 +200,68 @@ def _firma_filas(page) -> str:
     return "|".join(j["usuario"] for j in js[:3])
 
 
+def _click_siguiente(page) -> bool:
+    """Clickea la flecha 'siguiente' probando varias formas: el wrapper, con
+    scroll, con force, y por ultimo el svg/span de adentro. El paginador es un
+    SPA quisquilloso -- un solo intento fallaba en silencio."""
+    intentos = []
+    try:
+        sel = bot.primer_selector(page, SEL_SIGUIENTE, 4_000)
+        loc = page.locator(sel).first
+        try: loc.scroll_into_view_if_needed(timeout=2_000)
+        except Exception: pass
+        intentos.append(("wrapper", loc))
+        intentos.append(("wrapper+force", loc))
+    except Exception:
+        pass
+    for s in SEL_SIGUIENTE_HIJOS:
+        try:
+            l = page.locator(s).first
+            if l.count() > 0:
+                intentos.append(("hijo", l))
+        except Exception:
+            pass
+
+    for i, (nombre, loc) in enumerate(intentos):
+        try:
+            loc.click(timeout=4_000, force=("force" in nombre))
+            return True
+        except (PWError, PWTimeout):
+            continue
+    return False
+
+
+def _diag_paginador(page) -> None:
+    """Cuando no se puede avanzar, deja en el log POR QUE: cuantas filas hay,
+    que dice el paginador, y si el boton 'siguiente' siquiera existe. Asi la
+    proxima corrida distingue '1 sola pagina' de 'el boton no respondio'."""
+    try:
+        filas = len(jugadores_de_la_pagina(page))
+    except Exception:
+        filas = -1
+    hay_sig = 0
+    for s in SEL_SIGUIENTE + SEL_SIGUIENTE_HIJOS:
+        try:
+            hay_sig += page.locator(s).count()
+        except Exception:
+            pass
+    log.warning("  diag: %d fila(s) en la pagina, paginador='%s', "
+                "candidatos 'siguiente'=%d", filas, pagina_actual(page), hay_sig)
+
+
 def saltar_paginas(page, cuantas: int) -> bool:
     """Avanza `cuantas` paginas. False si alguna no avanzo (se quedo sin)."""
     for n in range(cuantas):
         antes = _firma_filas(page)
-        try:
-            sel = bot.primer_selector(page, SEL_SIGUIENTE, 6_000)
-            page.locator(sel).first.click(timeout=6_000)
-        except (PWError, PWTimeout) as e:
-            log.error("no pude clickear 'siguiente' (%s)", e)
+        if not _click_siguiente(page):
+            log.error("no encontre/pude clickear la flecha 'siguiente'")
+            _diag_paginador(page)
             return False
         # Esperar a que el contenido CAMBIE (no solo un timeout fijo): el panel
         # tarda distinto cada vez, y leer antes de que repinte daria un falso
-        # "no cambio". Hasta ~6s.
+        # "no cambio". Hasta ~8s.
         cambio = False
-        for _ in range(12):
+        for _ in range(16):
             page.wait_for_timeout(500)
             if _firma_filas(page) != antes:
                 cambio = True
@@ -214,6 +269,7 @@ def saltar_paginas(page, cuantas: int) -> bool:
         if not cambio:
             log.warning("la pagina no cambio: no hay mas paginas (o el boton "
                         "'siguiente' no respondio)")
+            _diag_paginador(page)
             return False
         log.info("  pagina -> %s", pagina_actual(page))
     return True
