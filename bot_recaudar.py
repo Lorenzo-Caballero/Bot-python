@@ -107,6 +107,11 @@ SEL_FILAS = [
 # Dentro de UNA fila (se busca relativo a ella, no desde #root).
 SEL_FILA_USUARIO = ".adm-bets-table-row-user__td-data-user"
 SEL_FILA_RETIRO  = "a.button.button_colors_full-transparent"
+# El saldo va en la 2da celda (columna SALDO): USUARIO | SALDO | OPERACIONES...
+# Se lee de AHI y no "el primer numero de la fila", porque los usuarios
+# terminan en numero (holajulio188, holasvero888): scanear digitos agarraba el
+# numero del NOMBRE, no el saldo -- el bug que hacia leer el orden al reves.
+SEL_FILA_SALDO = ":scope > div:nth-child(2)"
 
 SEL_TODO = [
     "#root > div > div.app__wrapper > main > div.app__wrapper__content > div > "
@@ -200,17 +205,7 @@ def preparar_listado(page, saltar: int) -> bool:
 def _saldos_de_la_pagina(page) -> list[float]:
     try:
         filas = page.locator(bot.primer_selector(page, SEL_FILAS, 8_000))
-        out = []
-        for i in range(min(filas.count(), 20)):
-            celdas = filas.nth(i).locator("div")
-            txt = ""
-            for j in range(min(celdas.count(), 4)):
-                t = (celdas.nth(j).inner_text(timeout=2_000) or "").strip()
-                if any(c.isdigit() for c in t) and "/" not in t:
-                    txt = t
-                    break
-            out.append(_num(txt))
-        return out
+        return [_saldo_de_fila(filas.nth(i)) for i in range(min(filas.count(), 20))]
     except Exception:
         return []
 
@@ -374,18 +369,22 @@ def jugadores_de_la_pagina(page) -> list[dict]:
             usuario = ""
         if not usuario:
             continue
-        saldo = 0.0
-        try:
-            celdas = fila.locator("div")
-            for j in range(min(celdas.count(), 4)):
-                t = (celdas.nth(j).inner_text(timeout=1_500) or "").strip()
-                if t and any(c.isdigit() for c in t) and "/" not in t and usuario not in t:
-                    saldo = _num(t)
-                    break
-        except Exception:
-            pass
-        out.append({"i": i, "usuario": usuario.splitlines()[0].strip(), "saldo": saldo})
+        out.append({"i": i, "usuario": usuario.splitlines()[0].strip(),
+                    "saldo": _saldo_de_fila(fila)})
     return out
+
+
+def _saldo_de_fila(fila) -> float:
+    """El saldo de UNA fila, leido de la celda SALDO (2da columna). 0.0 si no
+    se puede leer -- un 0 lo filtra min_saldo, o sea que ante la duda se
+    saltea, nunca se retira de mas."""
+    try:
+        t = (fila.locator(SEL_FILA_SALDO).first.inner_text(timeout=2_000) or "").strip()
+        # La celda de saldo puede traer la etiqueta 'PLAYER' u otra basura si
+        # la estructura cambio: si no hay digitos, es 0 (se saltea, seguro).
+        return _num(t) if any(c.isdigit() for c in t) else 0.0
+    except Exception:
+        return 0.0
 
 
 def filtrar_inactivos(usuarios: list[str], dias: int) -> tuple[set[str], dict]:
