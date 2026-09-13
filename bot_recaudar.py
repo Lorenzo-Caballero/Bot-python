@@ -198,8 +198,10 @@ def ordenar_por_saldo(page) -> bool:
             log.info("  orden: saldo de mayor a menor (%.2f ... %.2f)",
                      saldos[0], saldos[-1])
             return True
-        log.info("  quedo ascendente, clickeo de nuevo")
+        log.info("  quedo ascendente (%.0f ... %.0f), clickeo de nuevo",
+                 saldos[0], saldos[-1])
     log.error("no logre dejarlo de mayor a menor")
+    _foto(page, "recaudar_orden_fallo")
     return False
 
 
@@ -452,8 +454,23 @@ def filtrar_inactivos(usuarios: list[str], dias: int) -> tuple[set[str], dict]:
     return set(inact), inact
 
 
+def _foto(page, nombre: str) -> None:
+    """Captura la pantalla al volumen (bot.SHOTS = /datos/capturas en docker).
+    Es como se mira desde afuera qué está viendo el bot, sin el navegador."""
+    try:
+        page.screenshot(path=str(bot.SHOTS / f"{nombre}.png"))
+        log.info("  (foto: capturas/%s.png)", nombre)
+    except Exception:
+        pass
+
+
 def retirar_uno(page, indice: int, usuario: str, dry: bool) -> tuple[bool, str]:
-    """Abre RETIRO de esa fila, toca 'Todo' y confirma. (ok, detalle)."""
+    """Abre RETIRO de esa fila, toca 'Todo' y confirma. (ok, detalle).
+
+    Los tres botones (retiro de la fila, 'Todo', confirmar) son de React, igual
+    que la flecha del paginador y el header de orden: el click 'normal' NO
+    dispara su onClick. Por eso van por _disparar_click (dispatch_event). Este
+    era el motivo mas probable de que el retiro REAL no hiciera nada."""
     try:
         filas = page.locator(bot.primer_selector(page, SEL_FILAS, 8_000))
         fila = filas.nth(indice)
@@ -464,20 +481,23 @@ def retirar_uno(page, indice: int, usuario: str, dry: bool) -> tuple[bool, str]:
                   .inner_text(timeout=4_000) or "").strip().splitlines()[0].strip()
         if actual != usuario:
             return False, f"la fila {indice} ahora es '{actual}', no '{usuario}'"
-        fila.locator(SEL_FILA_RETIRO).first.click(timeout=8_000)
+        if not _disparar_click(fila.locator(SEL_FILA_RETIRO).first):
+            return False, "no pude clickear el boton RETIRO de la fila"
     except (PWError, PWTimeout) as e:
         return False, f"no pude abrir el retiro: {e}"
 
     page.wait_for_timeout(2_000)      # el panel tarda en montar la pantalla
 
     if "/withdrawal/" not in page.url:
+        _foto(page, "recaudar_retiro_sin_pantalla")
         return False, f"no llegue a la pantalla de retiro (url {page.url})"
 
     try:
         sel_todo = bot.primer_selector(page, SEL_TODO, 8_000)
-        page.locator(sel_todo).first.click(timeout=6_000)
+        if not _disparar_click(page.locator(sel_todo).first):
+            return False, "no pude tocar 'Todo'"
     except (PWError, PWTimeout) as e:
-        return False, f"no pude tocar 'Todo': {e}"
+        return False, f"no encontre 'Todo': {e}"
     page.wait_for_timeout(600)
 
     if dry:
@@ -487,8 +507,10 @@ def retirar_uno(page, indice: int, usuario: str, dry: bool) -> tuple[bool, str]:
         sel_ok = bot.primer_selector(page, SEL_CONFIRMAR, 8_000)
         btn = page.locator(sel_ok).first
         if not bot.esperar_habilitado(page, btn):
+            _foto(page, "recaudar_confirmar_apagado")
             return False, "el boton RETIRO siguio apagado (¿saldo 0?)"
-        btn.click(timeout=8_000)
+        if not _disparar_click(btn):
+            return False, "no pude confirmar el retiro"
     except (PWError, PWTimeout) as e:
         return False, f"no pude confirmar el retiro: {e}"
 
@@ -519,16 +541,23 @@ def recaudar(args, reporte: dict | None = None) -> int:
         if not preparar_listado(page, args.saltar):
             log.error("no pude dejar el listado ordenado y en la pagina %d+ "
                       "(corto para no tocar a los de mas saldo)", args.saltar)
+            _foto(page, "recaudar_preparar_fallo")
             browser.close()
             return 1
 
         jugadores = jugadores_de_la_pagina(page)
         if not jugadores:
             log.warning("la pagina %s no tiene jugadores", pagina_actual(page))
+            _foto(page, "recaudar_sin_jugadores")
             browser.close()
             return 0
 
-        log.info("pagina %s: %d jugador(es)", pagina_actual(page), len(jugadores))
+        # Una foto de lo que el bot ESTA viendo, siempre: es la unica forma de
+        # saber desde afuera (sin el navegador) que la pagina, el orden y los
+        # saldos leidos son los correctos. Se pisa en cada corrida.
+        _foto(page, "recaudar_pagina")
+        log.info("pagina %s: %d jugador(es) -> %s", pagina_actual(page), len(jugadores),
+                 ", ".join(f"{j['usuario']}={j['saldo']:.0f}" for j in jugadores[:8]))
 
         # Saldo minimo primero (barato) y despues la inactividad (una consulta).
         candidatos = [j for j in jugadores if j["saldo"] >= args.min_saldo]
@@ -631,7 +660,8 @@ def demonio(headless: bool, poll: int) -> int:
     url = _url_cola(api_url)
     s = requests.Session()
     s.headers.update({"X-API-Key": api_key, "User-Agent": bot.UA})
-    log.info("demonio de recaudacion escuchando %s (cada %ds)", url, poll)
+    log.info("demonio de recaudacion escuchando %s (cada %ds) [version %s]",
+             url, poll, os.environ.get("BOT_VERSION", "desconocido"))
 
     while True:
         pedido = None
