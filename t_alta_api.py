@@ -189,5 +189,49 @@ chequear("500 = revisar (pudo entrar)", A.evaluar_deposito(500) == "revisar")
 chequear("502 = revisar", A.evaluar_deposito(502) == "revisar")
 chequear("0 = revisar", A.evaluar_deposito(0) == "revisar")
 
+# ---------------------------------------------------------------------------
+# Con CUERPO: el codigo HTTP solo no alcanza (la plataforma contesta 200
+# igual cuando falla). Los tres primeros son casos REALES de produccion
+# (12-13/09/2026) que quedaron marcados 'hecha' costandole las fichas a tres
+# jugadores. Ver PARA-FAUNO-deposito.md.
+# ---------------------------------------------------------------------------
+print("\n=== Deposito: el CUERPO manda sobre el 200 ===")
+
+CH_WAF = ('<!DOCTYPE html>\n<html>\n<head>\n'
+          '<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">\n'
+          '<noscript><meta http-equiv="refresh" content="0; url=/exhkqyad"></noscript>')
+
+chequear('200 + {"status":0} = hecha (el unico exito real)',
+         A.evaluar_deposito(200, '{"status":0,"result":{}}') == "hecha")
+chequear("200 + challenge del WAF = reintentar (nunca llego al backend)",
+         A.evaluar_deposito(200, CH_WAF) == "reintentar")
+chequear('200 + {"status":501} = error (rechazo explicito, devolver fichas)',
+         A.evaluar_deposito(200, '{"status":501,"result":{},"error_message":"x"}') == "error")
+chequear("200 + HTML que NO es el WAF = revisar (un login no prueba nada)",
+         A.evaluar_deposito(200, '<html><form id=login></form></html>') == "revisar")
+chequear("200 + cuerpo vacio = revisar",
+         A.evaluar_deposito(200, "") == "revisar")
+chequear("200 + JSON sin 'status' = revisar",
+         A.evaluar_deposito(200, '{"result":{}}') == "revisar")
+chequear("200 + no-JSON = revisar",
+         A.evaluar_deposito(200, "ok gracias") == "revisar")
+chequear("200 + None = hecha (compatibilidad: sin cuerpo, criterio viejo)",
+         A.evaluar_deposito(200, None) == "hecha")
+chequear("400 manda aunque el cuerpo diga status:0",
+         A.evaluar_deposito(400, '{"status":0}') == "error")
+chequear("500 manda aunque el cuerpo sea el challenge",
+         A.evaluar_deposito(500, CH_WAF) == "revisar")
+
+print("\n=== es_challenge: la firma del WAF ===")
+chequear("/exhk en el cuerpo", A.es_challenge(CH_WAF) is True)
+chequear("noscript + refresh sin /exhk tambien",
+         A.es_challenge('<html><noscript><meta http-equiv="refresh" content="0"></noscript>') is True)
+chequear("un JSON normal no", A.es_challenge('{"status":0}') is False)
+chequear("un login pelado no", A.es_challenge('<html><form id=login></form></html>') is False)
+chequear("vacio no", A.es_challenge("") is False)
+chequear("None no rompe", A.es_challenge(None) is False)
+chequear("/exhk DESPUES de los 2000 chars no cuenta (solo el arranque)",
+         A.es_challenge(("x" * 2100) + "/exhk") is False)
+
 print(f"\n---------------------------------------\n{ok} OK, {fail} fallas")
 sys.exit(1 if fail else 0)

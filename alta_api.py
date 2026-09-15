@@ -121,21 +121,84 @@ def _parece_json(cuerpo: str) -> bool:
     return t.startswith("{") or t.startswith("[")
 
 
-def evaluar_deposito(status: int) -> str:
+# [goldpaw] parche cuerpo-del-deposito
+# (la marca es literal a proposito: scripts/vigilar-parche-deposito.sh del
+#  repo GOLDPAW la busca para saber si el arreglo esta, y con ella presente
+#  el parche en caliente se declara "ya parchado" y no toca nada)
+def es_challenge(cuerpo) -> bool:
+    """¿Este cuerpo es el challenge anti-bot de ServicePipe/Cloudflare?
+
+    El WAF responde 200 con HTML en vez de JSON, asi que el codigo HTTP no
+    dice nada. Las dos firmas, sobre los primeros ~2000 caracteres:
+    '/exhk' (la URL del desafio) o un <noscript> con http-equiv="refresh".
+
+    Un challenge PRUEBA que la request nunca llego al backend: por eso es el
+    UNICO caso donde reintentar es seguro con plata en el medio -- no puede
+    depositar dos veces ni crear dos jugadores. La misma funcion sirve para
+    el deposito y para el alta (PARA-FAUNO-deposito.md, punto 3).
+    """
+    ini = (cuerpo or "")[:2000]
+    return "/exhk" in ini or ("<noscript" in ini.lower()
+                              and 'http-equiv="refresh"' in ini.lower())
+
+
+def _leer_cuerpo_deposito(cuerpo) -> tuple[str, str]:
+    """(veredicto, detalle) mirando el CUERPO: 'ok'|'error'|'reintentar'|'dudoso'."""
+    t = (cuerpo or "").strip()
+    if not t:
+        return "dudoso", "respuesta vacia"
+    if es_challenge(t):
+        return "reintentar", "el WAF corto el deposito (challenge de ServicePipe)"
+    if t[0] == "<":
+        return "dudoso", "vino HTML en vez de JSON (login o proxy)"
+    try:
+        d = json.loads(t)
+    except Exception:
+        return "dudoso", "la respuesta no es JSON"
+    if not isinstance(d, dict) or "status" not in d:
+        return "dudoso", "JSON sin campo 'status'"
+    try:
+        st = int(d.get("status"))
+    except Exception:
+        return "dudoso", "el campo 'status' no es un numero"
+    if st == 0:
+        return "ok", ""
+    msg = d.get("error_message") or d.get("message") or ""
+    return "error", (f"la plataforma rechazo el deposito (status {st}) {msg}").strip()
+
+
+def evaluar_deposito(status: int, cuerpo: str | None = None) -> str:
     """Que hacer con la respuesta del POST de deposito de fichas.
 
-    Misma semantica conservadora de ejecutar_cargas.py, porque aca se mueve
-    plata: ante cualquier duda, NUNCA se reintenta (reintentar un deposito que
-    quizas entro es depositar dos veces).
+    EL CODIGO HTTP SOLO NO ALCANZA: la plataforma contesta 200 igual cuando
+    falla, y pone el resultado real en el cuerpo ({"status":0} = hecho,
+    {"status":501,...} = rechazado, HTML con /exhk = el WAF la corto antes de
+    llegar). Decidir solo por el 200 marco 'hecha' tres depositos que nunca
+    ocurrieron (12-13/09/2026) y los jugadores perdieron sus fichas.
 
-        'hecha'   -> 2xx: el panel lo acepto.
-        'error'   -> 4xx (menos 408/429): el server RECHAZO y no lo proceso.
-                     La cola devuelve las fichas.
-        'revisar' -> 5xx / 408 / 429 / status raro: pudo haber entrado igual.
-                     Lo mira una persona; no se reintenta solo.
+    Con cuerpo, manda el cuerpo; sin cuerpo (None) se cae al criterio viejo,
+    por compatibilidad con cualquier llamador que no lo pase.
+
+        'hecha'      -> 2xx con {"status":0} (o 2xx sin cuerpo, compat).
+        'error'      -> rechazo EXPLICITO (4xx, o 2xx con status != 0 en el
+                        JSON): el server no lo proceso, es seguro devolver
+                        las fichas.
+        'reintentar' -> el challenge del WAF: NO llego al backend, con
+                        certeza. La cola lo devuelve a 'pendiente' un numero
+                        acotado de veces y despues pide ayuda humana.
+        'revisar'    -> no se sabe (5xx / 408 / 429 / HTML raro / JSON sin
+                        status): pudo haber entrado. NUNCA se devuelven
+                        fichas ni se reintenta solo -- seria pagar dos veces.
     """
     if 200 <= status < 300:
-        return "hecha"
+        if cuerpo is None:
+            return "hecha"
+        v, _ = _leer_cuerpo_deposito(cuerpo)
+        if v == "ok":
+            return "hecha"
+        if v == "reintentar":
+            return "reintentar"
+        return "error" if v == "error" else "revisar"
     if 400 <= status < 500 and status not in (408, 429):
         return "error"
     return "revisar"

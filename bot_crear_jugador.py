@@ -1422,7 +1422,11 @@ async (payload) => {
   // muchas altas salen igual de rapido (cada una ~1s) pero el panel nunca ve
   // mas de `conc` conexiones simultaneas. Ese es el punto que aguanta la
   // concurrencia sin romperse.
-  const conc = Math.max(1, Math.min(payload.conc || 6, items.length || 1));
+  // 3 y no 6 (15/09/2026): seis conexiones simultaneas desde la misma IP es
+  // exactamente el patron que un WAF puntua como bot, y es la hipotesis que
+  // queda en pie para los challenges intermitentes (60 requests SECUENCIALES
+  // logueados no provocaron ninguno). Si con 3 siguen, probar 2.
+  const conc = Math.max(1, Math.min(payload.conc || 3, items.length || 1));
   // Techo de tiempo del LOTE entero, no solo por item: aunque cada fetch tenga
   // su timeout, N items en olas podrian sumar minutos si el panel cuelga todo.
   // Al vencerse el deadline, los items que faltan se devuelven como status 0
@@ -1564,17 +1568,34 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> tuple[dict,
             continue
 
         try:
-            resp = req.fetch(
-                url, method=metodo, data=cuerpo,
-                headers={"content-type": content_type},
-                timeout=ALTA_FETCH_TIMEOUT_MS, max_redirects=20,
-            )
-            st = resp.status
-            try:
-                txt = resp.text()
-            except Exception:
-                txt = ""
-            final_url = resp.url or ""
+            # [goldpaw] reintento del challenge en el alta
+            # El WAF contesta el challenge DE A RATOS (HTTP 200 con el HTML de
+            # /exhk). Caer al formulario no ayuda: cruza el MISMO WAF y falla
+            # tras 55s + 5 min de backoff -- el alta 284 del 14/09/2026 tardo
+            # 6 minutos asi, y el reintento por API salio a la primera. Un
+            # challenge prueba que la request NO llego al backend, asi que
+            # repetirla no puede crear dos jugadores. Tres intentos y, si los
+            # tres dan challenge, el comportamiento de siempre (formulario).
+            for _intento_waf in range(3):
+                resp = req.fetch(
+                    url, method=metodo, data=cuerpo,
+                    headers={"content-type": content_type},
+                    timeout=ALTA_FETCH_TIMEOUT_MS, max_redirects=20,
+                )
+                st = resp.status
+                try:
+                    txt = resp.text()
+                except Exception:
+                    txt = ""
+                final_url = resp.url or ""
+                if not alta_api.es_challenge(txt) or _intento_waf == 2:
+                    break
+                log.info("  fast-path %s / %s: challenge del WAF, reintento %s de 2",
+                         reg.get("id"), reg.get("usuario"), _intento_waf + 1)
+                # ServicePipe deja la cookie de clearance en la respuesta del
+                # propio challenge y req comparte cookies con el navegador:
+                # una pausa corta suele alcanzar.
+                time.sleep(1.5)
         except Exception as e:
             # Timeout / red / sesion: NO se da por creado. Al formulario, que
             # verifica y re-loguea. Nunca un cuelgue: fetch tiene timeout.
@@ -1625,13 +1646,18 @@ def _depositar_una(page, id_ganamos: int, monto: float) -> tuple[str, str]:
             timeout=45_000)
         st = r.status
         try:
-            txt = r.text()[:300]
+            # [goldpaw] parche cuerpo-del-deposito: ENTERO para decidir; el
+            # recorte a 300 es solo para el mensaje de la cola. Recortar antes
+            # de mirar era lo que hacia imposible parsear la respuesta.
+            txt_full = r.text()
+            txt = txt_full[:300]
         except Exception:
+            txt_full = None
             txt = ""
     except Exception as e:
         # No se sabe si el server lo proceso antes de cortarse: nunca 'error'.
         return "revisar", f"no se pudo confirmar el deposito ({e})"
-    estado = alta_api.evaluar_deposito(st)
+    estado = alta_api.evaluar_deposito(st, txt_full)
     return estado, f"deposito por API ({st}) {txt}".strip()
 
 
