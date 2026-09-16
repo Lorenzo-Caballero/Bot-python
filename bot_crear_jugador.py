@@ -1574,9 +1574,18 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> tuple[dict,
             # tras 55s + 5 min de backoff -- el alta 284 del 14/09/2026 tardo
             # 6 minutos asi, y el reintento por API salio a la primera. Un
             # challenge prueba que la request NO llego al backend, asi que
-            # repetirla no puede crear dos jugadores. Tres intentos y, si los
-            # tres dan challenge, el comportamiento de siempre (formulario).
-            for _intento_waf in range(3):
+            # repetirla no puede crear dos jugadores. Cinco intentos con
+            # espera CRECIENTE (1,5s / 3s / 4,5s / 6s): las 3 vueltas fijas
+            # de 1,5s no alcanzaban para los challenges persistentes del
+            # 16/09/2026. Si los cinco dan challenge, el comportamiento de
+            # siempre (formulario).
+            _WAF_INTENTOS = 5
+            for _intento_waf in range(_WAF_INTENTOS):
+                # Un latido por vuelta: el peor caso del bucle entero (5 fetch
+                # de hasta 15s + las esperas) roza los 90s del watchdog, y sin
+                # esto una pasada LEGITIMA con el panel lento moria por os._exit
+                # con el lote reclamado -- el incidente del 7/9 otra vez.
+                _latir()
                 resp = req.fetch(
                     url, method=metodo, data=cuerpo,
                     headers={"content-type": content_type},
@@ -1588,14 +1597,16 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> tuple[dict,
                 except Exception:
                     txt = ""
                 final_url = resp.url or ""
-                if not alta_api.es_challenge(txt) or _intento_waf == 2:
+                if not alta_api.es_challenge(txt) or _intento_waf == _WAF_INTENTOS - 1:
                     break
-                log.info("  fast-path %s / %s: challenge del WAF, reintento %s de 2",
-                         reg.get("id"), reg.get("usuario"), _intento_waf + 1)
+                log.info("  fast-path %s / %s: challenge del WAF, reintento %s de %s",
+                         reg.get("id"), reg.get("usuario"), _intento_waf + 1,
+                         _WAF_INTENTOS - 1)
                 # ServicePipe deja la cookie de clearance en la respuesta del
                 # propio challenge y req comparte cookies con el navegador:
-                # una pausa corta suele alcanzar.
-                time.sleep(1.5)
+                # una pausa suele alcanzar, y creciente le da aire al que
+                # viene persistente.
+                time.sleep(1.5 * (_intento_waf + 1))
         except Exception as e:
             # Timeout / red / sesion: NO se da por creado. Al formulario, que
             # verifica y re-loguea. Nunca un cuelgue: fetch tiene timeout.
@@ -2311,9 +2322,30 @@ def main() -> int:
                                 api.marcar(reg["id"], "error", msg,
                                            usuario=str(reg.get("usuario", "")))
                             else:
-                                # No se pudo mirar el listado: que decida el
-                                # formulario, que sabe verificar y re-loguear.
-                                restantes.append(reg)
+                                # No se pudo mirar el listado. ANTES esto caia
+                                # al formulario con el MISMO nombre -- y el
+                                # formulario cruza el MISMO WAF que acaba de
+                                # fallar: en el mejor caso confirma mas lento,
+                                # en el peor revienta ("No aparecio el
+                                # formulario") y ESE mensaje, que no matchea
+                                # ninguna pista de nombre ocupado, pisa el
+                                # diagnostico bueno. Paso el 16/09/2026 con
+                                # las altas 320, 323 y 324: veredicto
+                                # 'renombrar' correcto, formulario bloqueado,
+                                # y el jugador esperando el backoff de 5/20/60
+                                # con un nombre condenado. El 'ya existe' del
+                                # panel es CERTEZA: se reporta tal cual y la
+                                # cola renombra YA. El unico costo posible es
+                                # renombrar un alta que en realidad creo un
+                                # intento anterior nuestro (queda una cuenta
+                                # huerfana en el panel), y es menor que horas
+                                # de espera por un formulario que ahi no puede
+                                # aportar nada.
+                                log.warning("  %s / %s -> %s (a renombrar; "
+                                            "sin listado para confirmar)",
+                                            reg.get("id"), reg.get("usuario"), msg)
+                                api.marcar(reg["id"], "error", msg,
+                                           usuario=str(reg.get("usuario", "")))
                         else:
                             # None (respuesta dudosa): al formulario, que
                             # verifica contra el listado.
