@@ -5,30 +5,54 @@ bot_recaudar.py — Recauda el saldo de jugadores INACTIVOS desde el panel.
 
 ESTO SACA PLATA DE CUENTAS DE JUGADORES. Leé las salvaguardas antes de correrlo.
 
-QUE HACE
-    1. Entra al listado de jugadores del panel (URL_LISTADO, del .env).
-    2. Ordena por SALDO de mayor a menor.
-    3. SALTEA las primeras `--saltar` paginas (4 por defecto): los que mas
-       saldo tienen suelen ser los que acaban de cargar, y a esos no se los
-       toca.
-    4. De la pagina en la que quedo, para cada jugador: abre RETIRO, toca
-       "Todo" y confirma.
-    5. Vuelve al listado y RE-ORDENA: el panel limpia el orden despues de cada
-       retiro.
+POR QUE VA POR LA API Y NO POR EL DOM (16/09/2026)
+    Hasta hoy este script operaba el panel a mano: clickeaba el header para
+    ordenar por saldo, clickeaba la flecha del paginador, leia el saldo de la
+    celda, tocaba RETIRO/Todo/Confirmar. Todo eso pelea contra un React que no
+    escucha los clicks de Playwright, y por eso "ordenar" y "paginar" fallaban
+    intermitentemente (ocho commits intentandolo). El resto del proyecto -- las
+    altas (crear_lote_por_fetch), los depositos y retiros del colector
+    (_depositar_una, retirar_del_jugador) y el espejo de usuarios
+    (sync_usuarios) -- ya dejaron el DOM y hablan con la API REST del panel. Era
+    el ultimo que faltaba.
 
-LAS TRES SALVAGUARDAS, Y POR QUE
+    Ahora el listado sale de la MISMA API que ya usa sync_usuarios
+    (GET /agent_admin/user/?...), que trae id, username y balance de cada
+    jugador. Con eso:
+      * ORDENAR de mayor a menor es un sort en Python -- infalible, sin header
+        que clickear, sin re-verificar en cada pagina.
+      * PAGINAR y SALTAR es cortar una lista ordenada -- sin flechas.
+      * RETIRAR es POST /agent_admin/user/{id}/payment/ {operation:1, amount},
+        el MISMO endpoint que ya usa el colector para los retiros pedidos por
+        chat (probado con plata real). Con deteccion del challenge del WAF.
+
+QUE HACE
+    1. Trae TODOS los jugadores por la API del panel.
+    2. Los ordena por SALDO de mayor a menor (en Python).
+    3. SALTEA los primeros `--saltar` * 50 de mayor saldo (4 -> 200): los que
+       mas saldo tienen suelen ser los que acaban de cargar, y a esos no se los
+       toca. El dry-run muestra la lista EXACTA que va a tocar: es ahi donde se
+       confirma la seleccion, no en el numero de "saltar".
+    4. Para cada objetivo (tras los filtros de abajo): POST de retiro por su
+       saldo.
+
+LAS SALVAGUARDAS, Y POR QUE
     a) DRY-RUN POR DEFECTO. Sin --si no retira un peso: lista lo que HARIA.
        Que la primera corrida sea inofensiva no es ceremonia -- es la unica
        forma de ver a quien iba a tocar antes de tocarlo.
-    b) INACTIVIDAD DE VERDAD (--dias, 30 por defecto). "Pagina 4" no es un
-       criterio de inactividad: es una posicion en una lista que cambia sola.
-       El dia que haya menos jugadores, el primero de la pagina 4 puede ser
-       alguien que cargo ayer. Por eso, antes de retirar, el bot le pregunta
-       a NUESTRA base (api/inactivos.php) cuantos dias hace que cada uno no
-       aparece, y saltea a los activos, a los que no conoce y a los que no
-       tienen el dato. Con --sin-chequeo se puede apagar: no lo hagas.
+    b) INACTIVIDAD DE VERDAD (--dias, 30 por defecto). "Los primeros 200" no es
+       un criterio de inactividad: es una posicion en una lista que cambia
+       sola. Por eso, antes de retirar, el bot le pregunta a NUESTRA base
+       (api/inactivos.php) cuantos dias hace que cada uno no aparece, y saltea a
+       los activos, a los que no conoce y a los que no tienen el dato. Con
+       --sin-chequeo se puede apagar: no lo hagas.
     c) TOPES. --max (cuantos retiros por corrida) y --min-saldo (no tocar
        saldos chicos). Un bot que mueve plata sin techo es una mala noche.
+    d) EL MONTO SALE DEL SALDO QUE INFORMA LA API, no de un scrape. Y como el
+       objetivo son inactivos (30+ dias sin jugar), ese saldo no se mueve entre
+       que se lee y se retira. Si aun asi la plataforma tuviera menos, el POST
+       vuelve con status != 0 y se marca 'revisar' (no se reintenta: pudo haber
+       entrado), nunca se retira de mas.
 
 USO
     python bot_recaudar.py                      # dry-run: muestra y no toca
@@ -50,370 +74,152 @@ import time
 
 import requests
 from playwright.sync_api import sync_playwright
-from playwright.sync_api import Error as PWError
-from playwright.sync_api import TimeoutError as PWTimeout
 
 import bot_crear_jugador as bot
+import alta_api
 
 log = logging.getLogger("recaudar")
 
-# ---------------------------------------------------------------------------
-# SELECTORES del panel (capturados 12/9/2026 sobre agents.ganamos*.com).
-#
-# Cada uno lleva alternativas mas cortas: la cadena larga de #root > div > ...
-# se rompe con cualquier reacomodo del markup, y cuando se rompe el bot no
-# falla -- hace NADA en silencio, que con plata es peor. primer_selector()
-# prueba en orden y usa el primero que aparezca.
-# ---------------------------------------------------------------------------
-BASE = ("#root > div > div.app__wrapper > main > div.app__wrapper__content "
-        "> div.users > div.users-table.users-table_tab_all")
+# Cuantos jugadores de mayor saldo salta cada unidad de --saltar. 50 = el
+# tamaño de pagina de la API del panel (POR_PAGINA de sync_usuarios), asi
+# "saltar 4" son las primeras 4 "paginas" de mayor saldo, como antes. El
+# dry-run muestra a quien deja adentro, que es donde de verdad se confirma.
+SALTO_POR_PAGINA = 50
+# count por pagina al pedir el listado (mismo que sync_usuarios).
+API_POR_PAGINA = 50
+# Pausa entre paginas del GET: gentil con Cloudflare (el panel esta detras).
+API_PAUSA_PAGINA = 0.4
 
-SEL_ORDEN_SALDO = [
-    f"{BASE} > div.users-table__table > div.users-table__table-header > "
-    "div.users-table__table-header-head.users-table__table-header-head_balance",
-    ".users-table__table-header-head_balance",
-]
-SEL_PAGINA_ACTUAL = [
-    f"{BASE} > div.users-table__paginator-wrapper > div.paginator-switcher > "
-    "div > div.paginator-switcher__pages > div",
-    ".paginator-switcher__pages > div",
-]
-# El contenedor de los NUMEROS de pagina. Plan B para avanzar si la flecha no
-# responde: se clickea un numero mas alto que el actual.
-SEL_PAGINAS_CONTENEDOR = [
-    f"{BASE} > div.users-table__paginator-wrapper > div.paginator-switcher > "
-    "div > div.paginator-switcher__pages",
-    ".paginator-switcher__pages",
-]
-SEL_SIGUIENTE = [
-    f"{BASE} > div.users-table__paginator-wrapper > div.paginator-switcher > "
-    "div > div:nth-child(4)",
-    ".paginator-switcher > div > div:nth-child(4)",
-]
-# El nodo REALMENTE clickeable dentro de la flecha (el div wrapper no toma el
-# click; el que responde es el <path> del svg, confirmado sobre el panel el
-# 12/9/2026). Se prueban en orden, del mas especifico al mas general.
-SEL_SIGUIENTE_HIJOS = [
-    f"{BASE} > div.users-table__paginator-wrapper > div.paginator-switcher > "
-    "div > div:nth-child(4) > span > span > svg > path",
-    ".paginator-switcher > div > div:nth-child(4) svg > path",
-    ".paginator-switcher > div > div:nth-child(4) svg",
-    ".paginator-switcher > div > div:nth-child(4) span",
-]
-SEL_FILAS = [
-    f"{BASE} > div.users-table__table > div.users-table__tbody > div",
-    ".users-table__tbody > div",
-]
-# Dentro de UNA fila (se busca relativo a ella, no desde #root).
-SEL_FILA_USUARIO = ".adm-bets-table-row-user__td-data-user"
-SEL_FILA_RETIRO  = "a.button.button_colors_full-transparent"
-# El saldo va en la 2da celda (columna SALDO): USUARIO | SALDO | OPERACIONES...
-# Se lee de AHI y no "el primer numero de la fila", porque los usuarios
-# terminan en numero (holajulio188, holasvero888): scanear digitos agarraba el
-# numero del NOMBRE, no el saldo -- el bug que hacia leer el orden al reves.
-SEL_FILA_SALDO = ":scope > div:nth-child(2)"
+def _get_api(ctx, url, intentos: int = 4, espera: float = 2.0):
+    """GET a la API del panel con reintentos y deteccion del challenge del WAF.
 
-SEL_TODO = [
-    "#root > div > div.app__wrapper > main > div.app__wrapper__content > div > "
-    "div > div.withdrawal__top > div.withdrawal__input-block > div > "
-    "div.withdrawal__all-btn > button",
-    ".withdrawal__all-btn > button",
-]
-SEL_CONFIRMAR = [
-    "#root > div > div.app__wrapper > main > div.app__wrapper__content > div > "
-    "div > div.withdrawal__bottom > button.button.button_sizable_low.button_colors_default",
-    ".withdrawal__bottom > button.button_colors_default",
-]
-
-
-def _num(txt: str) -> float:
-    """'23.000,50' / '23,000.50' / '$ 1.234' -> float. 0.0 si no hay numero."""
-    t = "".join(c for c in (txt or "") if c.isdigit() or c in ".,-")
-    if not t:
-        return 0.0
-    # El ultimo separador es el decimal; los otros son de miles.
-    ic, ip = t.rfind(","), t.rfind(".")
-    if ic > ip:
-        t = t.replace(".", "").replace(",", ".")
-    else:
-        t = t.replace(",", "")
-    try:
-        return float(t)
-    except ValueError:
-        return 0.0
-
-
-def _disparar_click(loc) -> bool:
-    """Clickea `loc` de la forma que un icono/header de React SI escucha:
-    dispatch_event('click') primero (evento DOM directo, no le importa
-    pointer-events ni overlays), y force/click como respaldo. True si al menos
-    uno no tiro error."""
-    for metodo in ("dispatch", "force", "click"):
+    El panel corta la conexion seguido ('socket hang up') y Cloudflare a veces
+    responde el challenge (HTML). Las dos cosas se reintentan: un challenge NO
+    es un dato, es 'volve a preguntar'. Mismo criterio que sync_usuarios y el
+    colector. Devuelve el JSON, o lanza si no se pudo tras los reintentos."""
+    ultimo = None
+    for i in range(intentos):
         try:
-            if metodo == "dispatch":
-                loc.dispatch_event("click", timeout=3_000)
-            else:
-                loc.click(timeout=3_000, force=(metodo == "force"))
-            return True
-        except (PWError, PWTimeout):
-            continue
-    return False
+            r = ctx.request.get(url, timeout=60_000)
+            txt = r.text()
+            if alta_api.es_challenge(txt):
+                raise RuntimeError("challenge del WAF (Cloudflare)")
+            import json as _json
+            return _json.loads(txt)
+        except Exception as e:
+            ultimo = e
+            log.warning("  GET fallo (intento %d/%d): %s",
+                        i + 1, intentos, str(e).splitlines()[0][:120])
+            if i < intentos - 1:
+                time.sleep(espera * (i + 1))
+    raise ultimo
 
 
-def ordenar_por_saldo(page) -> bool:
-    """Deja el listado ordenado por saldo de MAYOR a MENOR.
+def traer_jugadores(ctx) -> list[dict]:
+    """TODOS los jugadores del agente, por la API del panel, ORDENADOS por
+    saldo de mayor a menor. [{'id', 'usuario', 'saldo'}].
 
-    El header alterna asc/desc en cada click, asi que no alcanza con clickear:
-    hay que MIRAR como quedo (leyendo la columna SALDO real, no el numero del
-    nombre). Si quedo ascendente, se clickea de nuevo.
+    Misma consulta que sync_usuarios.traer_todos (misma cuenta, mismos
+    jugadores). El orden lo hace Python -- no hay header que clickear ni que
+    re-verificar en cada pagina. Los baneados quedan afuera (is_banned=false),
+    como en el sync."""
+    me = _get_api(ctx, f"{bot.PANEL_API}/user/check")
+    agent_id = me["result"]["id"]
+    log.info("Agente %s (id %s)", me["result"].get("username", "?"), agent_id)
 
-    El click va por _disparar_click: el header es un elemento de React y el
-    click 'normal' NO dispara su onClick -- por eso antes 'ordenaba' de mentira
-    (pasaba de casualidad leyendo los numeros de los usuarios) y ahora, leyendo
-    el saldo real, se veia que nunca ordeno. Mismo arreglo que la flecha.
+    todos, pag = [], 0
+    while pag < 1000:
+        url = (f"{bot.PANEL_API}/agent_admin/user/?count={API_POR_PAGINA}&page={pag}"
+               f"&user_id={agent_id}&is_banned=false&is_direct_structure=false")
+        data = _get_api(ctx, url)
+        items = _items_de(data) or []
+        if not items:
+            break
+        for u in items:
+            uid = u.get("id")
+            usuario = (u.get("username") or "").strip()
+            saldo = u.get("balance") or 0
+            if uid is None or usuario == "":
+                continue
+            try:
+                saldo = float(saldo)
+            except (TypeError, ValueError):
+                saldo = 0.0
+            todos.append({"id": uid, "usuario": usuario, "saldo": saldo})
+        pag += 1
+        if pag % 10 == 0:
+            log.info("  ...%d jugadores (%d paginas)", len(todos), pag)
+        time.sleep(API_PAUSA_PAGINA)
+
+    todos.sort(key=lambda j: j["saldo"], reverse=True)
+    log.info("Total: %d jugadores, ordenados por saldo (mayor $%.0f -> menor $%.0f)",
+             len(todos), todos[0]["saldo"] if todos else 0,
+             todos[-1]["saldo"] if todos else 0)
+    return todos
+
+
+def _items_de(data):
+    """La lista de usuarios adentro de la respuesta, en cualquiera de sus
+    formas (la API envuelve en result/users/items/data). Igual que
+    sync_usuarios.items_de."""
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        for k in ("users", "items", "result", "data"):
+            v = data.get(k)
+            if isinstance(v, list):
+                return v
+            if isinstance(v, dict):
+                r = _items_de(v)
+                if r is not None:
+                    return r
+    return None
+
+
+def retirar_por_api(ctx, id_ganamos: int, monto: float) -> tuple[bool, str]:
+    """Retira `monto` del saldo del jugador por la API del panel. (ok, detalle).
+
+    MISMO endpoint y misma logica que colector/aprobar_cargas.retirar_del_jugador
+    (operation=1 = retiro, probado con plata real): el resultado viene en el
+    CUERPO, no en el codigo HTTP (el panel contesta 200 igual cuando falla).
+
+      * challenge del WAF -> reintento (no llego al backend, es seguro); si
+        persiste, se da por fallado sin reintentar mas.
+      * 2xx con status 0 -> retirado.
+      * 2xx con status != 0, o cuerpo ilegible, o !2xx -> NO retirado, y NO se
+        reintenta: pudo haber entrado, repetirlo seria sacar dos veces.
     """
-    try:
-        sel = bot.primer_selector(page, SEL_ORDEN_SALDO, 10_000)
-    except Exception as e:
-        log.error("no encuentro el header de saldo (%s)", e)
-        return False
-
-    header = page.locator(sel).first
-    for intento in (1, 2, 3):
-        antes = _saldos_de_la_pagina(page)
-        if not _disparar_click(header):
-            log.error("no pude clickear el header de saldo")
-            return False
-        # Esperar a que la tabla RE-ORDENE (el orden cambia el contenido);
-        # leer antes de eso daria el estado viejo. Hasta ~4s.
-        for _ in range(8):
-            page.wait_for_timeout(500)
-            saldos = _saldos_de_la_pagina(page)
-            if saldos != antes:
-                break
-        saldos = _saldos_de_la_pagina(page)
-        if len(saldos) < 2:
-            return True                      # una sola fila: nada que ordenar
-        if saldos[0] >= saldos[-1]:
-            log.info("  orden: saldo de mayor a menor (%.2f ... %.2f)",
-                     saldos[0], saldos[-1])
-            return True
-        log.info("  quedo ascendente (%.0f ... %.0f), clickeo de nuevo",
-                 saldos[0], saldos[-1])
-    log.error("no logre dejarlo de mayor a menor")
-    _foto(page, "recaudar_orden_fallo")
-    return False
-
-
-def preparar_listado(page, saltar: int) -> bool:
-    """Deja el listado LISTO para leer/retirar: recien cargado, ordenado por
-    saldo de mayor a menor, y en la pagina que toca. Se llama en CADA
-    actualizacion (al arrancar y antes de cada retiro), porque el panel pierde
-    el orden con cualquier cosa -- un retiro, un refresco. Ademas, tras
-    paginar, RE-VERIFICA que la pagina siga descendente y re-aplica el orden
-    una vez si se perdio: '888...188' que quede en '188...888' significaria
-    recaudar al reves. Devuelve False si no pudo dejarlo ordenado y paginado."""
-    page.goto(bot.URL_LISTADO, wait_until="domcontentloaded")
-    page.wait_for_timeout(1_200)
-    if not ordenar_por_saldo(page):
-        return False
-    if saltar and not saltar_paginas(page, saltar):
-        return False
-    # ¿Sigue de mayor a menor despues de paginar? Si no, el orden se cayo al
-    # cambiar de pagina: se re-aplica y se re-saltea UNA vez.
-    saldos = _saldos_de_la_pagina(page)
-    if len(saldos) >= 2 and saldos[0] < saldos[-1]:
-        log.warning("  el orden se perdio al paginar; lo re-aplico")
-        if not ordenar_por_saldo(page):
-            return False
-        if saltar and not saltar_paginas(page, saltar):
-            return False
-    return True
-
-
-def _saldos_de_la_pagina(page) -> list[float]:
-    try:
-        filas = page.locator(bot.primer_selector(page, SEL_FILAS, 8_000))
-        return [_saldo_de_fila(filas.nth(i)) for i in range(min(filas.count(), 20))]
-    except Exception:
-        return []
-
-
-def pagina_actual(page) -> str:
-    """Etiqueta de la pagina, solo para el log. NO se usa para decidir si
-    avanzo: SEL_PAGINA_ACTUAL es el CONTENEDOR de los numeros ('1 2 3 4...'),
-    que dice lo mismo en todas las paginas -- por eso saltar_paginas compara
-    el CONTENIDO de las filas, no esto."""
-    try:
-        sel = bot.primer_selector(page, SEL_PAGINA_ACTUAL, 5_000)
-        return (page.locator(sel).first.inner_text(timeout=3_000) or "?").strip().replace("\n", " ")
-    except Exception:
-        return "?"
-
-
-def _firma_filas(page) -> str:
-    """Los primeros nombres de la pagina actual, para saber si REALMENTE
-    cambio al pasar de pagina. Es infalible: no depende de como el panel
-    dibuje el paginador (que fue lo que rompio la deteccion por el numero)."""
-    js = jugadores_de_la_pagina(page)
-    return "|".join(j["usuario"] for j in js[:3])
-
-
-def _avanzo_desde(page, antes: str, seg: float = 6.0) -> bool:
-    """True apenas el contenido de las filas cambia respecto de `antes`."""
-    pasos = max(1, int(seg / 0.5))
-    for _ in range(pasos):
-        page.wait_for_timeout(500)
-        if _firma_filas(page) != antes:
-            return True
-    return False
-
-
-def _click_siguiente(page, antes: str) -> bool:
-    """Avanza UNA pagina y CONFIRMA que avanzo. El paginador es un icono SVG
-    de React: un click normal (aun con force) no llega al onClick -- por eso
-    el metodo que manda es dispatch_event('click'), que lanza el evento DOM
-    directo. Se prueban, EN ORDEN y verificando el avance tras cada uno: el
-    dispatch sobre el wrapper y sobre el svg/path, despues force y click de
-    verdad. Devuelve True solo si el contenido REALMENTE cambio."""
-    cands = []                      # (locator, metodo)
-    try:
-        sel = bot.primer_selector(page, SEL_SIGUIENTE, 4_000)
-        w = page.locator(sel).first
-        try: w.scroll_into_view_if_needed(timeout=2_000)
-        except Exception: pass
-        cands.append((w, "dispatch"))
-    except Exception:
-        w = None
-    for s in SEL_SIGUIENTE_HIJOS:
+    url = f"{bot.PANEL_API}/agent_admin/user/{int(id_ganamos)}/payment/"
+    cuerpo = ""
+    r = None
+    for i in range(3):
         try:
-            l = page.locator(s).first
-            if l.count() > 0:
-                cands.append((l, "dispatch"))
+            r = ctx.request.post(url, data={"operation": 1, "amount": int(round(monto))},
+                                 timeout=45_000)
+        except Exception as e:
+            return False, f"no se pudo confirmar el retiro ({e})"
+        try:
+            cuerpo = r.text()
         except Exception:
-            pass
-    if w is not None:
-        cands.append((w, "force"))
-        cands.append((w, "click"))
+            cuerpo = ""
+        if not alta_api.es_challenge(cuerpo):
+            break
+        if i == 2:
+            return False, f"el WAF corto el retiro (challenge persistente) | {cuerpo[:200]}"
+        time.sleep(1.5 * (i + 1))
 
-    for loc, metodo in cands:
-        try:
-            if metodo == "dispatch":
-                loc.dispatch_event("click", timeout=3_000)
-            else:
-                loc.click(timeout=3_000, force=(metodo == "force"))
-        except (PWError, PWTimeout):
-            continue
-        # Verificar corto entre metodos: si ESTE disparo el cambio, listo; si
-        # no, se prueba el siguiente en vez de rendirse en el primero que no
-        # tiro error (dispatch nunca tira aunque no haga nada).
-        if _avanzo_desde(page, antes, seg=2.5):
-            return True
-    return False
-
-
-def _click_numero_adelante(page) -> bool:
-    """Plan B cuando la flecha no responde: clickea el numero de pagina mas
-    ALTO que se vea (el de mas a la derecha en el contenedor de paginas), que
-    siempre esta hacia adelante. Avanzar de mas es SEGURO (mas lejos de los
-    que acaban de cargar); nunca retrocede."""
+    corto = cuerpo[:250]
+    if not r.ok:
+        return False, f"el panel respondio {r.status} | {corto}"
     try:
-        cont = bot.primer_selector(page, SEL_PAGINAS_CONTENEDOR, 3_000)
+        import json as _json
+        d = _json.loads(cuerpo)
     except Exception:
-        return False
-    nums = page.locator(cont).locator("div, span, button, a")
-    mejor = None
-    mejorN = -1
-    try:
-        for i in range(min(nums.count(), 30)):
-            el = nums.nth(i)
-            t = (el.inner_text(timeout=800) or "").strip()
-            if t.isdigit() and int(t) > mejorN:
-                mejorN, mejor = int(t), el
-    except Exception:
-        pass
-    if mejor is None:
-        return False
-    try:
-        mejor.click(timeout=3_000, force=True)
-        log.info("  (plan B: clickeo pagina %d)", mejorN)
-        return True
-    except (PWError, PWTimeout):
-        return False
-
-
-def _diag_paginador(page) -> None:
-    """Cuando no se puede avanzar, deja en el log POR QUE: cuantas filas hay,
-    que dice el paginador, y si el boton 'siguiente' siquiera existe. Asi la
-    proxima corrida distingue '1 sola pagina' de 'el boton no respondio'."""
-    try:
-        filas = len(jugadores_de_la_pagina(page))
-    except Exception:
-        filas = -1
-    hay_sig = 0
-    for s in SEL_SIGUIENTE + SEL_SIGUIENTE_HIJOS:
-        try:
-            hay_sig += page.locator(s).count()
-        except Exception:
-            pass
-    log.warning("  diag: %d fila(s) en la pagina, paginador='%s', "
-                "candidatos 'siguiente'=%d", filas, pagina_actual(page), hay_sig)
-
-
-def saltar_paginas(page, cuantas: int) -> bool:
-    """Avanza `cuantas` paginas. False si alguna no avanzo (se quedo sin)."""
-    for n in range(cuantas):
-        antes = _firma_filas(page)
-        # 1) la flecha 'siguiente' (dispatch/force/click, verificando avance)
-        cambio = _click_siguiente(page, antes)
-        # 2) si no avanzo, plan B: clickear un numero de pagina mas alto
-        if not cambio and _click_numero_adelante(page):
-            cambio = _avanzo_desde(page, antes, seg=6.0)
-
-        if not cambio:
-            log.warning("la pagina no cambio: no hay mas paginas (o ni la "
-                        "flecha ni los numeros respondieron)")
-            _diag_paginador(page)
-            return False
-        log.info("  pagina -> %s", pagina_actual(page))
-    return True
-
-
-def jugadores_de_la_pagina(page) -> list[dict]:
-    """[{'i': indice, 'usuario': str, 'saldo': float}] de la pagina actual."""
-    out: list[dict] = []
-    try:
-        filas = page.locator(bot.primer_selector(page, SEL_FILAS, 8_000))
-        total = filas.count()
-    except Exception as e:
-        log.error("no pude leer las filas: %s", e)
-        return out
-
-    for i in range(total):
-        fila = filas.nth(i)
-        try:
-            usuario = (fila.locator(SEL_FILA_USUARIO).first
-                       .inner_text(timeout=3_000) or "").strip()
-        except Exception:
-            usuario = ""
-        if not usuario:
-            continue
-        out.append({"i": i, "usuario": usuario.splitlines()[0].strip(),
-                    "saldo": _saldo_de_fila(fila)})
-    return out
-
-
-def _saldo_de_fila(fila) -> float:
-    """El saldo de UNA fila, leido de la celda SALDO (2da columna). 0.0 si no
-    se puede leer -- un 0 lo filtra min_saldo, o sea que ante la duda se
-    saltea, nunca se retira de mas."""
-    try:
-        t = (fila.locator(SEL_FILA_SALDO).first.inner_text(timeout=2_000) or "").strip()
-        # La celda de saldo puede traer la etiqueta 'PLAYER' u otra basura si
-        # la estructura cambio: si no hay digitos, es 0 (se saltea, seguro).
-        return _num(t) if any(c.isdigit() for c in t) else 0.0
-    except Exception:
-        return 0.0
+        return False, f"respuesta ilegible del panel ({r.status}) | {corto}"
+    if not isinstance(d, dict) or d.get("status") not in (0, "0"):
+        msg = (d.get("error_message") if isinstance(d, dict) else "") or ""
+        return False, f"la plataforma no hizo el retiro {msg} | {corto}".strip()
+    return True, f"retirado por API ({r.status})"
 
 
 def filtrar_inactivos(usuarios: list[str], dias: int) -> tuple[set[str], dict]:
@@ -454,70 +260,6 @@ def filtrar_inactivos(usuarios: list[str], dias: int) -> tuple[set[str], dict]:
     return set(inact), inact
 
 
-def _foto(page, nombre: str) -> None:
-    """Captura la pantalla al volumen (bot.SHOTS = /datos/capturas en docker).
-    Es como se mira desde afuera qué está viendo el bot, sin el navegador."""
-    try:
-        page.screenshot(path=str(bot.SHOTS / f"{nombre}.png"))
-        log.info("  (foto: capturas/%s.png)", nombre)
-    except Exception:
-        pass
-
-
-def retirar_uno(page, indice: int, usuario: str, dry: bool) -> tuple[bool, str]:
-    """Abre RETIRO de esa fila, toca 'Todo' y confirma. (ok, detalle).
-
-    Los tres botones (retiro de la fila, 'Todo', confirmar) son de React, igual
-    que la flecha del paginador y el header de orden: el click 'normal' NO
-    dispara su onClick. Por eso van por _disparar_click (dispatch_event). Este
-    era el motivo mas probable de que el retiro REAL no hiciera nada."""
-    try:
-        filas = page.locator(bot.primer_selector(page, SEL_FILAS, 8_000))
-        fila = filas.nth(indice)
-        # El nombre se re-verifica CONTRA LA FILA que vamos a tocar: entre que
-        # se leyo la lista y este click el panel pudo repaginar, y retirarle a
-        # otro por un indice viejo no tiene vuelta atras.
-        actual = (fila.locator(SEL_FILA_USUARIO).first
-                  .inner_text(timeout=4_000) or "").strip().splitlines()[0].strip()
-        if actual != usuario:
-            return False, f"la fila {indice} ahora es '{actual}', no '{usuario}'"
-        if not _disparar_click(fila.locator(SEL_FILA_RETIRO).first):
-            return False, "no pude clickear el boton RETIRO de la fila"
-    except (PWError, PWTimeout) as e:
-        return False, f"no pude abrir el retiro: {e}"
-
-    page.wait_for_timeout(2_000)      # el panel tarda en montar la pantalla
-
-    if "/withdrawal/" not in page.url:
-        _foto(page, "recaudar_retiro_sin_pantalla")
-        return False, f"no llegue a la pantalla de retiro (url {page.url})"
-
-    try:
-        sel_todo = bot.primer_selector(page, SEL_TODO, 8_000)
-        if not _disparar_click(page.locator(sel_todo).first):
-            return False, "no pude tocar 'Todo'"
-    except (PWError, PWTimeout) as e:
-        return False, f"no encontre 'Todo': {e}"
-    page.wait_for_timeout(600)
-
-    if dry:
-        return True, "DRY-RUN: no confirmo"
-
-    try:
-        sel_ok = bot.primer_selector(page, SEL_CONFIRMAR, 8_000)
-        btn = page.locator(sel_ok).first
-        if not bot.esperar_habilitado(page, btn):
-            _foto(page, "recaudar_confirmar_apagado")
-            return False, "el boton RETIRO siguio apagado (¿saldo 0?)"
-        if not _disparar_click(btn):
-            return False, "no pude confirmar el retiro"
-    except (PWError, PWTimeout) as e:
-        return False, f"no pude confirmar el retiro: {e}"
-
-    page.wait_for_timeout(2_000)
-    return True, "retirado"
-
-
 def recaudar(args, reporte: dict | None = None) -> int:
     # `reporte` (opcional): el demonio pasa un dict y esta funcion lo llena con
     # {objetivo, retirados, total, fallados, detalle} para reportarlo al CRM.
@@ -530,6 +272,9 @@ def recaudar(args, reporte: dict | None = None) -> int:
         page = ctx.new_page()
         page.set_default_timeout(15_000)
 
+        # La sesion se valida con el navegador (la cookie de login vive ahi);
+        # despues TODO va por ctx.request, que comparte esa cookie -- sin tocar
+        # el DOM. Igual que sync_usuarios y el colector.
         if not bot.sesion_viva(page):
             log.info("sin sesion valida, intento login...")
             if not bot.login_automatico(page) or not bot.sesion_viva(page):
@@ -538,39 +283,49 @@ def recaudar(args, reporte: dict | None = None) -> int:
                 return 1
             bot.guardar_sesion(ctx, page)
 
-        if not preparar_listado(page, args.saltar):
-            log.error("no pude dejar el listado ordenado y en la pagina %d+ "
-                      "(corto para no tocar a los de mas saldo)", args.saltar)
-            _foto(page, "recaudar_preparar_fallo")
+        try:
+            jugadores = traer_jugadores(ctx)
+        except Exception as e:
+            log.error("no pude leer el listado por la API: %s", e)
             browser.close()
             return 1
-
-        jugadores = jugadores_de_la_pagina(page)
         if not jugadores:
-            log.warning("la pagina %s no tiene jugadores", pagina_actual(page))
-            _foto(page, "recaudar_sin_jugadores")
+            log.warning("el panel no devolvio jugadores")
             browser.close()
             return 0
 
-        # Una foto de lo que el bot ESTA viendo, siempre: es la unica forma de
-        # saber desde afuera (sin el navegador) que la pagina, el orden y los
-        # saldos leidos son los correctos. Se pisa en cada corrida.
-        _foto(page, "recaudar_pagina")
-        log.info("pagina %s: %d jugador(es) -> %s", pagina_actual(page), len(jugadores),
-                 ", ".join(f"{j['usuario']}={j['saldo']:.0f}" for j in jugadores[:8]))
+        # SALTAR los primeros de mayor saldo (los que suelen acabar de cargar).
+        # Es cortar la lista ya ordenada: sin flechas, sin re-verificar orden.
+        saltar_n = max(0, args.saltar) * SALTO_POR_PAGINA
+        if saltar_n:
+            log.info("salteo los %d jugador(es) de mayor saldo (--saltar %d x %d)",
+                     saltar_n, args.saltar, SALTO_POR_PAGINA)
+        restantes = jugadores[saltar_n:]
+        if not restantes:
+            log.warning("tras saltar %d no queda nadie (hay %d jugadores en total)",
+                        saltar_n, len(jugadores))
+            browser.close()
+            return 0
+
+        log.info("de mayor saldo entre los que quedan: %s",
+                 ", ".join(f"{j['usuario']}=${j['saldo']:.0f}" for j in restantes[:8]))
 
         # Saldo minimo primero (barato) y despues la inactividad (una consulta).
-        candidatos = [j for j in jugadores if j["saldo"] >= args.min_saldo]
-        for j in jugadores:
-            if j["saldo"] < args.min_saldo:
-                log.info("    saltea %s: saldo %.2f < minimo %.2f",
-                         j["usuario"], j["saldo"], args.min_saldo)
+        candidatos = [j for j in restantes if j["saldo"] >= args.min_saldo]
+        bajos = len(restantes) - len(candidatos)
+        if bajos:
+            log.info("    %d salteado(s) por saldo < minimo $%.0f", bajos, args.min_saldo)
 
         if args.sin_chequeo:
             log.warning("!! --sin-chequeo: NO se verifica inactividad contra la base")
             permitidos = {j["usuario"] for j in candidatos}
         else:
-            permitidos, _ = filtrar_inactivos([j["usuario"] for j in candidatos], args.dias)
+            # Solo se consulta la inactividad de los primeros candidatos que
+            # podrian entrar (tope * un colchon), no de miles: inactivos.php
+            # recibe una lista acotada y la seleccion final respeta el orden.
+            tope_consulta = max(args.max * 3, args.max + 20)
+            permitidos, _ = filtrar_inactivos(
+                [j["usuario"] for j in candidatos[:tope_consulta]], args.dias)
 
         objetivo = [j for j in candidatos if j["usuario"] in permitidos][: args.max]
         total = sum(j["saldo"] for j in objetivo)
@@ -595,28 +350,17 @@ def recaudar(args, reporte: dict | None = None) -> int:
 
         hechos, fallados, recaudado = 0, 0, 0.0
         for j in objetivo:
-            log.info("-> %s ($%.2f)", j["usuario"], j["saldo"])
-            # Cada retiro arranca del listado recien ordenado: el panel pierde
-            # el orden al retirar, y los indices de fila cambian con el. Se
-            # re-ordena y re-verifica (preparar_listado), como al arrancar.
-            if not preparar_listado(page, args.saltar):
-                log.error("   no pude volver a la pagina ordenada: corto")
-                break
-            vivos = jugadores_de_la_pagina(page)
-            fila = next((v for v in vivos if v["usuario"] == j["usuario"]), None)
-            if fila is None:
-                log.warning("   ya no esta en esta pagina, lo dejo para la proxima")
-                continue
-            ok, detalle = retirar_uno(page, fila["i"], j["usuario"], dry=False)
+            log.info("-> %s (id %s, $%.2f)", j["usuario"], j["id"], j["saldo"])
+            ok, detalle = retirar_por_api(ctx, int(j["id"]), j["saldo"])
             if ok:
                 hechos += 1
-                recaudado += fila["saldo"]
+                recaudado += j["saldo"]
                 log.info("   OK  %s", detalle)
             else:
                 fallados += 1
                 log.warning("   FALLO %s", detalle)
             reporte["detalle"].append({
-                "usuario": j["usuario"], "saldo": fila["saldo"],
+                "usuario": j["usuario"], "saldo": j["saldo"],
                 "ok": ok, "detalle": detalle,
             })
             time.sleep(1.0)
