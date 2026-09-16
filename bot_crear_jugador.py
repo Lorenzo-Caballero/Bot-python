@@ -1,5 +1,5 @@
 """
-Bot de creacion automatica de jugadores en agents.ganamosonline.com
+Bot de creacion automatica de jugadores en el panel de agentes (agents.ganamos7.com desde el 16/09/2026)
 
 Flujo:
     login.php -> tabla jugadores -> cola_panel.php -> este bot -> panel
@@ -39,8 +39,8 @@ Operacion:
 Archivo .env (esta en .gitignore, no subirlo):
     API_URL=https://ganamoscrm.online/gp-api/altas_cola.php
     API_KEY=una-clave-larga-y-random
-    PANEL_URL=https://agents.ganamosonline.com/user/create-player
-    LOGIN_URL=https://agents.ganamosonline.com/
+    PANEL_URL=https://agents.ganamos7.com/user/create-player
+    LOGIN_URL=https://agents.ganamos7.com/
     PANEL_USER=...
     PANEL_PASS=...
     POLL_SEGUNDOS=30
@@ -203,14 +203,19 @@ def guardar_plantilla(pl: dict) -> None:
 # ---------------------------------------------------------------------------
 # DESTINO
 # ---------------------------------------------------------------------------
+# agents.ganamos7.com desde el 16/09/2026 (decision del dueño): es EL MISMO
+# panel que agents.ganamosonline.com (probado a mano: misma cuenta, mismo
+# saldo, mismos jugadores) pero servido por nginx pelado, sin el Cloudflare
+# que tiraba challenges intermitentes y trabo altas y depositos. El .env de
+# cada contenedor manda sobre estos defaults.
 PANEL_URL = os.environ.get(
-    "PANEL_URL", "https://agents.ganamosonline.com/user/create-player"
+    "PANEL_URL", "https://agents.ganamos7.com/user/create-player"
 )
 # La pantalla de login vive en la RAIZ, no en /login: el panel es un SPA y esa
 # ruta no existe (te deja en una pagina sin el campo de password, y el bot falla
 # con "No encontre los campos del login"). Mismo motivo por el que
 # es_pantalla_login() busca el boton 'Acceder' en vez de mirar la URL.
-LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamosonline.com/")
+LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamos7.com/")
 
 # Host del panel: se usa para distinguir el POST real de la telemetria.
 #
@@ -1517,11 +1522,16 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> tuple[dict,
 
     context.request es una llamada HTTP de verdad: comparte la sesion (las
     cookies del navegador logueado), tiene TIMEOUT real y NO toca ninguna
-    pagina, asi que no puede colgarse. Se puede porque agents.ganamosonline.com
-    NO esta detras del WAF (ver CLAUDE.md): no hace falta el TLS de Chrome para
-    cruzarlo. Si algun dia SI se protegiera, la request fallaria limpio (o
-    devolveria el challenge HTML) y el reg caeria al formulario -- nunca a un
-    cuelgue.
+    pagina, asi que no puede colgarse.
+
+    SOBRE EL WAF (corregido el 16/09/2026): aca decia que ganamosonline "no
+    esta detras del WAF" -- la medicion dio lo contrario (Cloudflare, 403 a
+    curl pelado, challenges intermitentes que trabaron altas y depositos).
+    Desde el 16/09 el panel es agents.ganamos7.com: nginx pelado, sin
+    Cloudflare adelante. El reintento del challenge de mas abajo QUEDA
+    IGUAL: es defensa en profundidad, y si la puerta cambia o se protege,
+    la request falla limpio (o devuelve el challenge HTML) y el reg cae al
+    formulario -- nunca a un cuelgue.
 
     Secuencial: cada POST es ~300ms-1s. Un lote de N tarda N*eso, sin colgarse.
     El lote ENTERO esta acotado por ALTA_LOTE_DEADLINE_MS: esa proteccion

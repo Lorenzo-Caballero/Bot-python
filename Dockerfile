@@ -1,4 +1,4 @@
-# Bot de alta de jugadores en agents.ganamosonline.com (Playwright + Chromium).
+# Bot de alta de jugadores en el panel de agentes (Playwright + Chromium).
 #
 # Se usa python:slim + `playwright install --with-deps` en vez de la imagen
 # oficial de Playwright a proposito: asi la version del navegador SIEMPRE
