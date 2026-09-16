@@ -13,3 +13,11 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+
+# Copias de respaldo del .env que deja la edicion a mano en el VPS: llevan
+# PANEL_USER/PANEL_PASS, y un `git add -A` descuidado las subiria. Verificado
+# el 16/09/2026: en el historial de este repo NUNCA hubo ninguna (solo
+# .env.example) -- esto es preventivo, no una limpieza.
+.env.bak.*
+.env.*.bak
+*.env.bak
