@@ -363,6 +363,12 @@ def _avisar(reporte: dict, linea: str = "", *, fase: str = "", paso: str = "") -
         reporte["fase"] = fase
     if paso:
         reporte["paso"] = paso
+    # QUE VERSION DEL BOT CORRIO ESTA CORRIDA. Sin esto, mirando el log no hay
+    # forma de saber si lo que fallo ya estaba arreglado o si el contenedor
+    # quedo con la imagen vieja -- y el recaudador vive detras de un profile
+    # del compose, asi que es justo el que se queda atras en cada deploy. El
+    # 21/09/2026 se perdieron dos corridas en esa duda.
+    reporte.setdefault("bot", os.environ.get("BOT_VERSION", "desconocida"))
 
     rid = reporte.get("_id")
     if not rid:
