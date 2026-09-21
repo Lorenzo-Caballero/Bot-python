@@ -260,6 +260,60 @@ def filtrar_inactivos(usuarios: list[str], dias: int) -> tuple[set[str], dict]:
     return set(inact), inact
 
 
+# Cuantas lineas de log se conservan para la pantalla. Es una ventana, no un
+# archivo: el log completo sigue yendo a stdout del contenedor. 200 lineas
+# entran de sobra en el campo `resultado` (60 KB) y cubren una corrida entera.
+LOG_MAX = 200
+
+
+def _avisar(reporte: dict, linea: str = "", *, fase: str = "", paso: str = "") -> None:
+    """Anota el avance y lo MANDA al CRM, para que la pantalla lo muestre mientras pasa.
+
+    POR QUE EXISTE (pedido del dueno, 21/09/2026): *"que desde el frontend vaya
+    mostrando el proceso, retiro por retiro, que se vea reflejado en el momento"*
+    y *"si hay algun log de error tambien mostrarlo en pantalla asi depuramos"*.
+
+    Antes este bot escribia UNA vez, al terminar: una recaudacion de 25
+    jugadores eran varios minutos de "En curso..." en el CRM y despues todo
+    junto. Con plata de por medio, no ver que esta pasando es lo peor de las dos
+    opciones -- y cuando fallaba, el motivo quedaba en el log del contenedor,
+    que hay que ir a buscar por SSH.
+
+    BEST-EFFORT ABSOLUTO: si el POST falla, se sigue recaudando. Un reporte de
+    progreso que pueda abortar una corrida a medio camino seria peor que no
+    tener reporte -- quedarian jugadores con el saldo retirado y una fila sin
+    cerrar.
+    """
+    if linea:
+        hora = time.strftime("%H:%M:%S")
+        reporte.setdefault("log", []).append(f"{hora} · {linea}")
+        # Se recorta por el principio: lo ultimo que paso es lo que se mira.
+        if len(reporte["log"]) > LOG_MAX:
+            reporte["log"] = reporte["log"][-LOG_MAX:]
+    if fase:
+        reporte["fase"] = fase
+    if paso:
+        reporte["paso"] = paso
+
+    rid = reporte.get("_id")
+    if not rid:
+        return          # corrida por consola (sin CRM detras): solo el log
+    api_url = os.environ.get("API_URL", "")
+    api_key = os.environ.get("API_KEY", "")
+    if not api_url or not api_key:
+        return
+    try:
+        # `_id` es de uso interno: no viaja al CRM.
+        cuerpo = {k: v for k, v in reporte.items() if k != "_id"}
+        requests.post(
+            _url_cola(api_url), params={"accion": "avance"},
+            headers={"X-API-Key": api_key, "User-Agent": bot.UA},
+            json={"id": rid, "resultado": cuerpo}, timeout=8,
+        )
+    except Exception:
+        pass    # ver arriba: nunca frena la recaudacion
+
+
 def recaudar(args, reporte: dict | None = None) -> int:
     # `reporte` (opcional): el demonio pasa un dict y esta funcion lo llena con
     # {objetivo, retirados, total, fallados, detalle} para reportarlo al CRM.
@@ -283,16 +337,22 @@ def recaudar(args, reporte: dict | None = None) -> int:
                 return 1
             bot.guardar_sesion(ctx, page)
 
+        _avisar(reporte, "buscando jugadores en el panel...",
+                fase="buscando", paso="Trayendo el listado del panel")
         try:
             jugadores = traer_jugadores(ctx)
         except Exception as e:
             log.error("no pude leer el listado por la API: %s", e)
+            _avisar(reporte, f"ERROR al leer el listado: {e}", fase="error")
             browser.close()
             return 1
         if not jugadores:
             log.warning("el panel no devolvio jugadores")
+            _avisar(reporte, "el panel no devolvio jugadores", fase="error")
             browser.close()
             return 0
+        _avisar(reporte, f"{len(jugadores)} jugadores traidos; ordeno por saldo",
+                paso="Ordenando por saldo y filtrando")
 
         # SALTAR los primeros de mayor saldo (los que suelen acabar de cargar).
         # Es cortar la lista ya ordenada: sin flechas, sin re-verificar orden.
@@ -332,6 +392,10 @@ def recaudar(args, reporte: dict | None = None) -> int:
         reporte["objetivo"] = [{"usuario": j["usuario"], "saldo": j["saldo"]} for j in objetivo]
         reporte["total_objetivo"] = total
 
+        _avisar(reporte,
+                f"{len(objetivo)} jugador(es) seleccionados, ${total:,.0f} en total"
+                .replace(",", "."),
+                paso=("A recaudar" if args.si else "Prueba: no se toca nada"))
         log.info("")
         log.info("=== %s: %d jugador(es), $%.2f en total ===",
                  "A RECAUDAR" if args.si else "DRY-RUN (no se toca nada)",
@@ -340,34 +404,57 @@ def recaudar(args, reporte: dict | None = None) -> int:
             log.info("    %-28s $%.2f", j["usuario"], j["saldo"])
         if not objetivo:
             log.info("    (nadie cumple las condiciones)")
+            _avisar(reporte, "nadie cumple las condiciones", fase="listo")
             browser.close()
             return 0
         if not args.si:
             log.info("")
             log.info("Esto fue una PRUEBA. Si es lo que queres, agrega --si")
+            _avisar(reporte, "prueba terminada (no se retiro nada)", fase="listo")
             browser.close()
             return 0
 
         hechos, fallados, recaudado = 0, 0, 0.0
-        for j in objetivo:
+        reporte["de"] = len(objetivo)
+        _avisar(reporte, f"empiezo a retirar de {len(objetivo)} jugador(es)",
+                fase="retirando", paso="Retirando")
+        for n, j in enumerate(objetivo, 1):
             log.info("-> %s (id %s, $%.2f)", j["usuario"], j["id"], j["saldo"])
+            # El "voy por este" se manda ANTES del POST: si el retiro se cuelga
+            # --el panel tarda, el WAF desafia-- la pantalla muestra en quien
+            # se colgo, que es justo lo que hace falta para depurarlo.
+            reporte["hechos"] = n - 1
+            _avisar(reporte, f"{j['usuario']}: retirando ${j['saldo']:,.0f}".replace(",", "."),
+                    paso=f"Retirando {n} de {len(objetivo)}")
             ok, detalle = retirar_por_api(ctx, int(j["id"]), j["saldo"])
             if ok:
                 hechos += 1
                 recaudado += j["saldo"]
                 log.info("   OK  %s", detalle)
+                _avisar(reporte, f"{j['usuario']}: OK, ${j['saldo']:,.0f} retirados".replace(",", "."))
             else:
                 fallados += 1
                 log.warning("   FALLO %s", detalle)
+                # El motivo COMPLETO va a la pantalla: es lo que se necesita
+                # para saber si fue el WAF, la sesion o el saldo.
+                _avisar(reporte, f"{j['usuario']}: ERROR - {detalle}")
             reporte["detalle"].append({
                 "usuario": j["usuario"], "saldo": j["saldo"],
                 "ok": ok, "detalle": detalle,
             })
+            reporte["hechos"] = n
+            reporte["retirados"] = hechos
+            reporte["total"] = recaudado
+            reporte["fallados"] = fallados
+            _avisar(reporte)      # la lista parcial, tras cada retiro
             time.sleep(1.0)
 
         reporte["retirados"] = hechos
         reporte["total"] = recaudado
         reporte["fallados"] = fallados
+        _avisar(reporte,
+                f"listo: {hechos} retirado(s), {fallados} fallado(s)", fase="listo",
+                paso="Terminada")
         log.info("")
         log.info("=== Listo: %d retirado(s) por $%.2f, %d fallado(s) ===",
                  hechos, recaudado, fallados)
@@ -426,7 +513,11 @@ def demonio(headless: bool, poll: int) -> int:
                  pedido["dias"], pedido["saltar"], pedido["tope"],
                  pedido["min_saldo"], pedido.get("pedido_por", "?"))
 
-        reporte: dict = {}
+        # `_id` es lo que habilita el reporte EN VIVO: con el, _avisar()
+        # manda cada paso a recaudar_cola.php?accion=avance y el CRM lo
+        # muestra mientras pasa. Una corrida por consola no lo trae y solo
+        # escribe en el log, como siempre.
+        reporte: dict = {"_id": pid}
         estado, mensaje = "hecha", None
         try:
             args = _ns(si=not pedido["dry_run"], dias=pedido["dias"],
@@ -439,11 +530,18 @@ def demonio(headless: bool, poll: int) -> int:
         except Exception as e:
             log.exception("pedido #%d exploto", pid)
             estado, mensaje = "error", str(e)[:255]
+            # Que el motivo llegue a la pantalla del CRM: es la unica forma de
+            # depurar sin entrar por SSH al contenedor.
+            try:
+                _avisar(reporte, f"EXCEPCION: {e}", fase="error")
+            except Exception:
+                pass
 
         try:
             s.post(url, params={"accion": "marcar"},
                    json={"id": pid, "estado": estado,
-                         "resultado": reporte, "mensaje": mensaje}, timeout=20).raise_for_status()
+                         "resultado": {k: v for k, v in reporte.items() if k != "_id"},
+                         "mensaje": mensaje}, timeout=20).raise_for_status()
             log.info("== pedido #%d -> %s ==", pid, estado)
         except Exception as e:
             log.error("no pude marcar el pedido #%d: %s", pid, e)
