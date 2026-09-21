@@ -455,7 +455,8 @@ def recaudar(args, reporte: dict | None = None) -> int:
             log.info("    %d salteado(s) por saldo < minimo $%.0f", bajos, args.min_saldo)
 
         if args.sin_chequeo:
-            log.warning("!! --sin-chequeo: NO se verifica inactividad contra la base")
+            log.warning("!! sin chequeo de inactividad: se toma el orden del panel tal cual")
+            _avisar(reporte, "SIN filtro de inactividad: se toma el orden del panel tal cual")
             permitidos = {j["usuario"] for j in candidatos}
         else:
             # Solo se consulta la inactividad de los primeros candidatos que
@@ -604,7 +605,12 @@ def demonio(headless: bool, poll: int) -> int:
                        # no lo trae y se cae a `saltar * 50`, como antes.
                        saltar_jug=pedido.get("saltar_jug"),
                        max=pedido["tope"],
-                       min_saldo=pedido["min_saldo"], sin_chequeo=False,
+                       min_saldo=pedido["min_saldo"],
+                       # Lo decide el CRM por corrida (21/09/2026): sin el
+                       # filtro, la pagina N del panel es la pagina N del bot,
+                       # que es lo que se pidio. Un server viejo no lo manda y
+                       # el filtro queda puesto, como siempre.
+                       sin_chequeo=bool(pedido.get("sin_chequeo")),
                        headless=headless)
             rc = recaudar(args, reporte)
             if rc != 0 and reporte.get("fallados", 0) > 0:
