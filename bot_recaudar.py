@@ -68,9 +68,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sys
 import time
+
+from decimal import Decimal, ROUND_DOWN
 
 import requests
 from playwright.sync_api import sync_playwright
@@ -176,6 +179,43 @@ def _items_de(data):
     return None
 
 
+def monto_retirable(monto: float) -> float:
+    """El monto a pedir: NUNCA mas de lo que el jugador tiene.
+
+    EL BUG (21/09/2026, encontrado con el log en pantalla que se agrego ese
+    mismo dia). Esto mandaba `int(round(monto))`, o sea que REDONDEABA HACIA
+    ARRIBA y le pedia a la plataforma mas plata de la que habia:
+
+        belu5364: retirando $19      <- su saldo era $18,60
+        ERROR {"status":501,"error_message":"Balance is insufficient"}
+
+    Explica exactamente lo que se veia. En la corrida #15, de 10 jugadores:
+    los de $18,60 y $18,55 fallaron (round -> 19) y los de $18,50 y $18,40
+    salieron (round -> 18, porque Python redondea .5 al par). En la #14
+    fallaron los 20: todos tenian entre $17,50 y $17,55, y round() los llevaba
+    a 18.
+
+    Redondear hacia arriba es inofensivo al DEPOSITAR --le entras un centavo
+    de mas-- y fatal al RETIRAR. No son la misma operacion aunque compartan
+    endpoint.
+
+    Se trunca a 2 decimales hacia abajo: se lleva todo lo que se pueda sin
+    pasarse nunca. Si la plataforma no aceptara decimales, retirar_por_api
+    reintenta con el entero (ver ahi).
+
+    CON Decimal Y NO CON floor(monto*100)/100, que es lo primero que uno
+    escribe: en binario 18.40*100 es 1839.9999... y el floor se come un
+    centavo de CADA retiro. Sobre cien jugadores eso es plata que quedo en
+    cuentas que se estaban vaciando, y del lado nuestro no se ve.
+    """
+    if monto is None:
+        return 0.0
+    v = Decimal(str(monto))
+    if v <= 0:
+        return 0.0
+    return float(v.quantize(Decimal("0.01"), rounding=ROUND_DOWN))
+
+
 def retirar_por_api(ctx, id_ganamos: int, monto: float) -> tuple[bool, str]:
     """Retira `monto` del saldo del jugador por la API del panel. (ok, detalle).
 
@@ -192,9 +232,10 @@ def retirar_por_api(ctx, id_ganamos: int, monto: float) -> tuple[bool, str]:
     url = f"{bot.PANEL_API}/agent_admin/user/{int(id_ganamos)}/payment/"
     cuerpo = ""
     r = None
+    pedido = monto_retirable(monto)
     for i in range(3):
         try:
-            r = ctx.request.post(url, data={"operation": 1, "amount": int(round(monto))},
+            r = ctx.request.post(url, data={"operation": 1, "amount": pedido},
                                  timeout=45_000)
         except Exception as e:
             return False, f"no se pudo confirmar el retiro ({e})"
@@ -218,8 +259,36 @@ def retirar_por_api(ctx, id_ganamos: int, monto: float) -> tuple[bool, str]:
         return False, f"respuesta ilegible del panel ({r.status}) | {corto}"
     if not isinstance(d, dict) or d.get("status") not in (0, "0"):
         msg = (d.get("error_message") if isinstance(d, dict) else "") or ""
+
+        # SI RECHAZO UN MONTO CON CENTAVOS, se reintenta con el entero.
+        # No se sabe si la plataforma acepta decimales --el saldo los tiene,
+        # pero el deposito siempre viajo entero-- asi que en vez de suponerlo
+        # se prueba: primero el monto exacto, y si lo rechaza, el entero de
+        # abajo. Peor seria elegir el entero de entrada y dejar los centavos
+        # de cada jugador sin retirar.
+        #
+        # ESTE ES EL UNICO REINTENTO DE UNA ESCRITURA EN TODO EL PROYECTO, y
+        # se permite porque el rechazo es EXPLICITO y determinista: status 501
+        # con su mensaje prueba que la plataforma NO movio un peso. La regla
+        # que sigue en pie es la otra: una respuesta AMBIGUA (ilegible, 5xx,
+        # timeout) no se reintenta nunca, porque ahi si pudo haber entrado.
+        if pedido != int(pedido):
+            entero = int(math.floor(pedido))
+            if entero > 0:
+                log.info("   reintento con el entero ($%d): la plataforma no tomo los centavos", entero)
+                try:
+                    r2 = ctx.request.post(url, data={"operation": 1, "amount": entero}, timeout=45_000)
+                    c2 = r2.text()
+                    d2 = _json.loads(c2)
+                    if isinstance(d2, dict) and d2.get("status") in (0, "0"):
+                        return True, f"retirado por API ({r2.status}) por ${entero} (sin los centavos)"
+                    msg2 = (d2.get("error_message") if isinstance(d2, dict) else "") or ""
+                    return False, f"la plataforma no hizo el retiro {msg2 or msg} | {c2[:250]}".strip()
+                except Exception as e:
+                    # Ambiguo: NO se vuelve a intentar (pudo haber entrado).
+                    return False, f"no se pudo confirmar el reintento entero ({e})"
         return False, f"la plataforma no hizo el retiro {msg} | {corto}".strip()
-    return True, f"retirado por API ({r.status})"
+    return True, f"retirado por API ({r.status}) por ${pedido:.2f}"
 
 
 def filtrar_inactivos(usuarios: list[str], dias: int) -> tuple[set[str], dict]:
@@ -356,10 +425,19 @@ def recaudar(args, reporte: dict | None = None) -> int:
 
         # SALTAR los primeros de mayor saldo (los que suelen acabar de cargar).
         # Es cortar la lista ya ordenada: sin flechas, sin re-verificar orden.
-        saltar_n = max(0, args.saltar) * SALTO_POR_PAGINA
+        # EN JUGADORES, no en "paginas" (21/09/2026). "Pagina" significaba una
+        # cosa en el panel --donde el operador elige 10, 25 o 50 por pagina-- y
+        # otra aca, que usaba el tamaño de la API (50). Mirando la pagina 4 del
+        # panel se veian saldos de $75 y este bot, con el mismo "4", saltaba
+        # 200 y tocaba los de $17: los dos numeros correctos, hablando de cosas
+        # distintas. El jugador es la unidad que no cambia de significado.
+        # `saltar` (paginas) sigue andando para quien lo llame por consola.
+        saltar_n = getattr(args, "saltar_jug", None)
+        if saltar_n is None:
+            saltar_n = max(0, args.saltar) * SALTO_POR_PAGINA
+        saltar_n = max(0, int(saltar_n))
         if saltar_n:
-            log.info("salteo los %d jugador(es) de mayor saldo (--saltar %d x %d)",
-                     saltar_n, args.saltar, SALTO_POR_PAGINA)
+            log.info("salteo los %d jugador(es) de mayor saldo", saltar_n)
         restantes = jugadores[saltar_n:]
         if not restantes:
             log.warning("tras saltar %d no queda nadie (hay %d jugadores en total)",
@@ -521,7 +599,11 @@ def demonio(headless: bool, poll: int) -> int:
         estado, mensaje = "hecha", None
         try:
             args = _ns(si=not pedido["dry_run"], dias=pedido["dias"],
-                       saltar=pedido["saltar"], max=pedido["tope"],
+                       saltar=pedido["saltar"],
+                       # La cola manda los jugadores a saltear; un server viejo
+                       # no lo trae y se cae a `saltar * 50`, como antes.
+                       saltar_jug=pedido.get("saltar_jug"),
+                       max=pedido["tope"],
                        min_saldo=pedido["min_saldo"], sin_chequeo=False,
                        headless=headless)
             rc = recaudar(args, reporte)
@@ -553,6 +635,8 @@ def main() -> int:
         description="Recauda el saldo de jugadores inactivos desde el panel.")
     ap.add_argument("--demonio", action="store_true",
                     help="escucha la cola del CRM y ejecuta los pedidos (para el VPS)")
+    ap.add_argument("--saltar-jug", type=int, default=None, dest="saltar_jug",
+                    help="saltear los N jugadores de mayor saldo (gana sobre --saltar)")
     ap.add_argument("--poll", type=int, default=20,
                     help="cada cuantos segundos revisa la cola, en --demonio (20)")
     ap.add_argument("--si", action="store_true",

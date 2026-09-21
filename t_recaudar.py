@@ -109,10 +109,18 @@ ctx = FakeCtx([FakeResp('{"status":0}', status=500)])
 okr, det = R.retirar_por_api(ctx, 123, 5000)
 chequear("500 -> NO retirado", okr is False, det)
 
-# el amount viaja entero (pesos), como el depósito
+# EL MONTO NUNCA PUEDE SER MAYOR AL SALDO. Acá decía "el amount viaja entero
+# (pesos), como el depósito" y chequeaba que 1234.9 se mandara como 1235. Esa
+# suposición --que retirar y depositar son la misma operación porque comparten
+# endpoint-- es la que rompió la recaudación: redondear hacia ARRIBA es
+# inofensivo al depositar (entrás un centavo de más) y fatal al retirar, porque
+# le pedís a la plataforma plata que el jugador no tiene. El 21/09/2026, con el
+# log en pantalla: "belu5364: retirando $19" sobre un saldo de $18,60 ->
+# {"status":501,"error_message":"Balance is insufficient"}. En una corrida
+# fallaron los 20 de 20 por esto.
 ctx = FakeCtx([FakeResp('{"status":0}')])
 R.retirar_por_api(ctx, 77, 1234.9)
-chequear("el monto se manda entero", ctx.request.posts[0]["data"]["amount"] == 1235,
+chequear("el monto NUNCA supera el saldo", ctx.request.posts[0]["data"]["amount"] <= 1234.9,
          str(ctx.request.posts[0]["data"]))
 chequear("operation = 1 (retiro)", ctx.request.posts[0]["data"]["operation"] == 1)
 
@@ -161,4 +169,62 @@ chequear("nada reconocible -> None", R._items_de({"raro": 1}) is None)
 
 print("\n" + "-" * 39)
 print(f"{ok} OK, {fail} fallas")
+# ---------------------------------------------------------------------------
+print("")
+print("=== El monto del retiro NUNCA puede ser mayor al saldo ===")
+for saldo in [18.60, 18.55, 18.50, 18.40, 17.55, 17.50, 16.90, 75.60, 66.0,
+              0.01, 1234.567, 3.999]:
+    pedido = R.monto_retirable(saldo)
+    chequear("$%s: pide $%s (nunca de mas)" % (saldo, pedido), pedido <= saldo,
+             "pediria %s sobre un saldo de %s" % (pedido, saldo))
+
+# Y NO SE COME CENTAVOS, que es el error de la version obvia:
+# floor(18.40*100)/100 da 18.39 en binario, y eso es plata que queda en una
+# cuenta que se estaba vaciando, sin que nada lo diga.
+for x in [18.40, 16.90, 75.60, 0.10]:
+    chequear("no pierde el centavo por punto flotante (%s)" % x,
+             R.monto_retirable(x) == x, str(R.monto_retirable(x)))
+
+chequear("un saldo en 0 pide 0", R.monto_retirable(0) == 0.0)
+chequear("un saldo negativo pide 0 (nunca un retiro al reves)",
+         R.monto_retirable(-5) == 0.0)
+chequear("None pide 0", R.monto_retirable(None) == 0.0)
+chequear("los milicentavos se truncan hacia ABAJO",
+         R.monto_retirable(9.999) == 9.99, str(R.monto_retirable(9.999)))
+
+# Si la plataforma rechaza el monto con centavos, se reintenta con el entero
+# de abajo. Es el UNICO reintento de una escritura del proyecto, y se permite
+# porque el rechazo es EXPLICITO: status != 0 con cuerpo legible prueba que no
+# movio un peso. Una respuesta AMBIGUA no se reintenta nunca.
+ctx = FakeCtx([FakeResp('{"status":501,"error_message":"Balance is insufficient"}'),
+               FakeResp('{"status":0}')])
+okr, det = R.retirar_por_api(ctx, 55, 18.60)
+chequear("rechazo con centavos -> reintenta con el entero", okr is True, det)
+chequear("   y ese intento fue por el entero de ABAJO",
+         ctx.request.posts[1]["data"]["amount"] == 18,
+         str(ctx.request.posts[1]["data"]))
+
+ctx = FakeCtx([FakeResp('{"status":501,"error_message":"Balance is insufficient"}'),
+               FakeResp('{"status":0}')])
+okr, det = R.retirar_por_api(ctx, 55, 20.0)
+chequear("un entero rechazado NO se reintenta", okr is False, det)
+chequear("   (un solo POST)", len(ctx.request.posts) == 1, str(len(ctx.request.posts)))
+
+# ---------------------------------------------------------------------------
+print("")
+print("=== 'Saltar' se cuenta en JUGADORES, no en paginas del panel ===")
+# "Pagina" significaba una cosa en el panel --donde el operador elige 10, 25 o
+# 50 por pagina-- y otra aca (50 fijo, el tamaño de la API). Mirando la pagina
+# 4 del panel se veian saldos de $75 y el bot, con el mismo "4", saltaba 200 y
+# tocaba los de $17: los dos numeros correctos, hablando de cosas distintas.
+_src = open(R.__file__, encoding="utf-8").read()
+chequear("el bot acepta saltar_jug", "saltar_jug" in _src)
+chequear("y lo prefiere sobre las paginas",
+         'saltar_n = getattr(args, "saltar_jug", None)' in _src)
+chequear("con respaldo a saltar*50 para un server viejo",
+         "saltar_n = max(0, args.saltar) * SALTO_POR_PAGINA" in _src)
+
+print("")
+print("-" * 39)
+print("%d OK, %d fallas" % (ok, fail))
 sys.exit(0 if fail == 0 else 1)
