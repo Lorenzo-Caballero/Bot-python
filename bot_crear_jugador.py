@@ -676,7 +676,30 @@ def tipear(page, selector, valor: str) -> None:
     selector = primer_selector(page, selector)
     loc = page.locator(selector).first
     loc.wait_for(state="visible", timeout=10_000)
-    loc.click()
+
+    # ENFOCAR NO ES CLICKEAR, Y ESA DIFERENCIA COSTABA 15 SEGUNDOS POR CAMPO.
+    #
+    # `click()` le pide a Playwright que el elemento sea ACCIONABLE: visible,
+    # quieto, habilitado y -- la que muerde -- que no lo tape nadie. Cualquier
+    # cosa del panel encima (un cartel, un spinner, un modal que se esta
+    # cerrando, el overlay del WAF) lo deja esperando hasta el timeout por
+    # defecto, que son 15 s. Por campo. Y despues tira
+    # `Locator.click: Timeout 15000ms exceeded`, que no dice nada de lo que
+    # realmente paso y manda a buscar el selector, que estaba bien.
+    #
+    # Nahuel, 01/10/2026: "la creacion de usuario estaba lenta". Era esto: el
+    # alta no fallaba por el formulario, se quedaba esperando a poder tocarlo.
+    #
+    # Para TIPEAR no hace falta clickear: alcanza con enfocar, y `focus()` no
+    # exige accionabilidad. Se intenta igual el click primero --con 3 s en vez
+    # de 15, porque si en 3 s no se puede, algo lo esta tapando-- para no
+    # cambiar el comportamiento cuando la pagina esta sana: hay paneles que
+    # abren el desplegable recien al click.
+    try:
+        loc.click(timeout=3_000)
+    except (PWTimeout, PWError):
+        loc.focus()
+
     loc.fill("")                                   # limpia
     # 30-80ms por tecla eran ~5 s solo en llenar el form. React registra igual
     # con 8-18: lo que importa es que sean eventos de teclado de verdad, no la
