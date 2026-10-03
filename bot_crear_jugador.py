@@ -866,8 +866,46 @@ def _login_con(page, user: str, clave: str) -> bool:
 
     if es_pantalla_login(page):
         page.screenshot(path=str(SHOTS / "login_fallido.png"))
-        log.error("Segui en el login. Puede ser password incorrecta, captcha o 2FA. "
-                  "Mira capturas/login_fallido.png y si hace falta corre --login")
+
+        # QUE DIGA QUE PASO, NO DONDE MIRARLO.
+        #
+        # "Puede ser password incorrecta, captcha o 2FA" son tres problemas que
+        # se arreglan en tres lugares distintos, y mandar a abrir un PNG adentro
+        # de un contenedor es pedirle a alguien que haga de intermediario entre
+        # el bot y su propia pantalla. El 03/10/2026 costo dos dias de ida y
+        # vuelta: el panel rechazaba el login y nadie podia decir por que.
+        #
+        # La pagina SIEMPRE lo dice en alguna parte -- "contraseña incorrecta",
+        # "demasiados intentos", "verificacion requerida". Esto lo levanta y lo
+        # pone en el log, que es donde se mira primero.
+        motivo = ""
+        try:
+            # Los mensajes de error del formulario primero: son los especificos.
+            for sel in (".error", ".alert", "[role=alert]", ".invalid-feedback",
+                        ".ant-form-item-explain", ".MuiFormHelperText-root"):
+                for t in page.locator(sel).all_text_contents():
+                    t = " ".join(t.split())
+                    if t and t not in motivo:
+                        motivo += (" | " if motivo else "") + t[:120]
+                if motivo:
+                    break
+            # Si el formulario no dice nada, el texto visible de la pagina sirve
+            # para distinguir un captcha de una cuenta bloqueada.
+            if not motivo:
+                cuerpo = " ".join((page.inner_text("body") or "").split())
+                for pista in ("captcha", "verific", "bloquea", "intentos",
+                              "incorrect", "invalid", "suspend"):
+                    i = cuerpo.lower().find(pista)
+                    if i >= 0:
+                        motivo = cuerpo[max(0, i - 60):i + 120]
+                        break
+        except Exception:
+            pass
+
+        log.error("Segui en el login (usuario %s). La pantalla dice: %s",
+                  user or "?", motivo or "(nada legible -- mira capturas/login_fallido.png)")
+        log.error("password incorrecta, captcha o 2FA se arreglan en lugares "
+                  "distintos: el texto de arriba dice cual es.")
         return False
 
     log.info("Login OK -> %s", page.url)
