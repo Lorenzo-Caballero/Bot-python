@@ -2204,6 +2204,31 @@ def main() -> int:
             if not login_automatico(page) or not sesion_viva(page):
                 log.error("No pude entrar al panel. Corre: python %s --login",
                           Path(sys.argv[0]).name)
+
+                # QUE SE SEPA AFUERA, Y QUE NO SE MACHAQUE EL PANEL.
+                #
+                # Salir aca con --restart unless-stopped es un bucle: Docker
+                # relanza, falla el login, sale, relanza. El bot de un cliente
+                # estuvo DOS DIAS asi (03/10/2026, usuario oromaris333), o sea
+                # miles de intentos de login contra el panel -- que es
+                # exactamente como se consigue que una cuenta de agente quede
+                # bloqueada por intentos fallidos. El bot sabia el motivo y lo
+                # escribia clarito en `docker logs`, que nadie abre.
+                #
+                # El reporte convierte esos dos dias de silencio en una linea
+                # que se lee con un GET a salud_bot.php. La espera le saca la
+                # metralleta al bucle sin dejar de reintentar: la clave se
+                # puede corregir en cualquier momento y tiene que agarrar sola.
+                try:
+                    api.estado("login_rechazado",
+                               "el panel no acepta las credenciales del CRM "
+                               f"(usuario {PANEL_USER or 'sin usuario'})")
+                except Exception:
+                    pass
+                log.error("Espero %d s antes de salir: sin esto el reinicio "
+                          "automatico machaca el login del panel.",
+                          ESPERA_LOGIN_FALLIDO)
+                time.sleep(ESPERA_LOGIN_FALLIDO)
                 browser.close()
                 return 1
             guardar_sesion(ctx, page)
