@@ -178,6 +178,34 @@ def _latir() -> None:
     WD_LATIDO[0] = time.monotonic()
 
 
+# ---------------------------------------------------------------------------
+# ALTAS RECLAMADAS Y TODAVIA SIN RESOLVER.
+#
+# Existe por lo que dice el comentario de arriba, pero del lado del cuelgue de
+# VERDAD: el latido por item mato los falsos positivos del watchdog, y cuando
+# el watchdog acierta sigue haciendo os._exit con lo que este proceso tenia
+# reclamado. Esas altas quedan 'procesando' hasta el rescate de zombies, 15
+# MINUTOS despues -- y para el jugador eso no se ve como un error: se ve como
+# que la cuenta "tarda". Paso el 7/10/2026: un alta entro 19:49:36, el
+# watchdog la dejo huerfana a los 92s, y recien volvia a tomarse 20:06.
+#
+# El set se llena al reclamar y se vacia al marcar, asi no hay que acordarse
+# de mantenerlo en cada camino (fast-path, formulario, renombrado).
+EN_VUELO: set[int] = set()
+_EN_VUELO_LOCK = threading.Lock()
+
+
+def _en_vuelo_sumar(ids) -> None:
+    with _EN_VUELO_LOCK:
+        EN_VUELO.update(int(i) for i in ids)
+
+
+def _en_vuelo_sacar(*ids) -> None:
+    with _EN_VUELO_LOCK:
+        for i in ids:
+            EN_VUELO.discard(int(i))
+
+
 def cargar_plantilla() -> dict | None:
     """La plantilla aprendida, si existe y parece completa."""
     try:
@@ -553,7 +581,12 @@ class ApiJugadores:
         # estaba diciendo que no, sin una sola linea en el log.
         if isinstance(j, dict) and j.get("ok") is False:
             raise ErrorApi(f"La API rechazo el pedido: {j.get('error', 'sin detalle')}")
-        return j.get("datos", [])
+        datos = j.get("datos", [])
+        # Quedan anotadas como "mias y sin resolver" hasta que marcar() las
+        # saque: si el watchdog mata el proceso en el medio, son exactamente
+        # las que hay que devolver a la cola.
+        _en_vuelo_sumar(d.get("id") for d in datos if d.get("id"))
+        return datos
 
     def diagnostico(self) -> None:
         """Loguea contra que cola esta hablando y que hay adentro.
@@ -595,7 +628,7 @@ class ApiJugadores:
         r.raise_for_status()
         return r.json()
 
-    def liberar(self, ids: list | None = None) -> int:
+    def liberar(self, ids: list | None = None, timeout: int = 20) -> int:
         """Devuelve a 'pendiente' los que quedaron en 'procesando'.
 
         Con `ids` libera SOLO esos (los que reclamo ESTE proceso). Sin ids
@@ -606,8 +639,13 @@ class ApiJugadores:
         veces."""
         cuerpo = {"ids": [int(i) for i in ids]} if ids else {}
         r = self.s.post(self.url, params={"accion": "liberar"},
-                        json=cuerpo, timeout=20)
+                        json=cuerpo, timeout=timeout)
         r.raise_for_status()
+        if ids:
+            _en_vuelo_sacar(*ids)
+        else:
+            with _EN_VUELO_LOCK:
+                EN_VUELO.clear()
         return int(r.json().get("liberados", 0))
 
     def marcar(self, registro_id, estado: str, mensaje: str = "",
@@ -624,6 +662,12 @@ class ApiJugadores:
         respuesta del panel al crearlo. Se guarda en la fila para que el
         deposito de fichas tenga el id sin depender del sync (ver migracion
         55). Opcional: si no se pudo capturar, no se manda."""
+        # Resuelta: ya no es de este proceso. Se saca ANTES de mandar el
+        # POST a proposito -- si el marcar falla, la fila queda 'procesando'
+        # y la rescata el zombie, que es el camino correcto; devolverla
+        # ademas por el watchdog la pondria 'pendiente' con intentos=0 y
+        # podria crearla dos veces.
+        _en_vuelo_sacar(registro_id)
         cuerpo = {"id": registro_id, "estado": estado, "mensaje": mensaje[:500]}
         if usuario:
             cuerpo["usuario"] = usuario
@@ -2323,6 +2367,29 @@ def main() -> int:
                     log.error("WATCHDOG: el loop lleva %.0fs sin avanzar "
                               "(page.evaluate colgado?). Reinicio el proceso para "
                               "que Docker lo levante con navegador fresco.", quieto)
+                    # DEVOLVER LO RECLAMADO ANTES DE MORIR. Sin esto quedan
+                    # 'procesando' hasta el rescate de zombies -- 15 minutos
+                    # en los que el jugador ve que su cuenta "tarda" y no hay
+                    # ningun error en ningun lado. Se liberan solo las de ESTE
+                    # proceso (nunca el liberar global: con dos instancias
+                    # vivas le sacaria a la otra lo que esta creando).
+                    #
+                    # El cuelgue es de Playwright, no de requests, asi que la
+                    # sesion HTTP sigue sana; igual va con timeout corto y
+                    # atrapando todo, porque de aca se sale muriendo pase lo
+                    # que pase. Un timeout de mas seria el watchdog colgado,
+                    # que es justo lo que vino a arreglar.
+                    with _EN_VUELO_LOCK:
+                        mios = sorted(EN_VUELO)
+                    if mios:
+                        try:
+                            n = api.liberar(mios, timeout=8)
+                            log.error("WATCHDOG: devueltas %d alta(s) a la cola "
+                                      "(%s) para que el proximo arranque las "
+                                      "tome ya", n, mios)
+                        except Exception as e:
+                            log.error("WATCHDOG: no pude devolver %s a la cola "
+                                      "(%s). Vuelven solas en 15 min.", mios, e)
                     os._exit(1)
 
         threading.Thread(target=_watchdog, daemon=True).start()
