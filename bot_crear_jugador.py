@@ -173,9 +173,22 @@ except ValueError:
 # que quedaban 'procesando' hasta el rescate de zombies, 15 minutos despues.
 WD_LATIDO = [time.monotonic()]
 
+# DONDE estaba el loop en su ultimo latido. El watchdog lo imprime al matar el
+# proceso, y es la diferencia entre saber que paso y adivinarlo.
+#
+# Hizo falta el 7/10/2026: un cuelgue de 92s se reporto como "page.evaluate
+# colgado?" --el texto fijo del mensaje-- cuando el fast-path habia dejado de
+# usar page.evaluate un mes antes (6/9/2026, migrado a context.request). O
+# sea que el unico dato que daba el watchdog señalaba a un culpable que ya no
+# existia, y para ubicar el cuelgue de verdad hubo que reconstruirlo restando
+# segundos entre dos lineas de log.
+WD_FASE = ["arranque"]
 
-def _latir() -> None:
+
+def _latir(fase: str = "") -> None:
     WD_LATIDO[0] = time.monotonic()
+    if fase:
+        WD_FASE[0] = fase
 
 
 # ---------------------------------------------------------------------------
@@ -1663,7 +1676,7 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> tuple[dict,
     for i, reg in enumerate(regs):
         # Cada item esta acotado por su timeout: un latido por item mantiene
         # al watchdog cazando cuelgues DE VERDAD, sin matar lotes sanos.
-        _latir()
+        _latir(f"fast-path: armando el alta {reg.get('id')}")
         if (time.monotonic() - t0) * 1000 > ALTA_LOTE_DEADLINE_MS:
             sin_intentar = list(regs[i:])
             log.warning("  fast-path: deadline del lote (%.0fs): %d alta(s) "
@@ -1700,7 +1713,8 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> tuple[dict,
                 # de hasta 15s + las esperas) roza los 90s del watchdog, y sin
                 # esto una pasada LEGITIMA con el panel lento moria por os._exit
                 # con el lote reclamado -- el incidente del 7/9 otra vez.
-                _latir()
+                _latir(f"fast-path: POST al panel, alta {reg.get('id')}"
+                       + (f" (reintento WAF {_intento_waf})" if _intento_waf else ""))
                 resp = req.fetch(
                     url, method=metodo, data=cuerpo,
                     headers={"content-type": content_type},
@@ -2364,9 +2378,15 @@ def main() -> int:
                 time.sleep(15)
                 quieto = time.monotonic() - WD_LATIDO[0]
                 if quieto > _wd_timeout:
-                    log.error("WATCHDOG: el loop lleva %.0fs sin avanzar "
-                              "(page.evaluate colgado?). Reinicio el proceso para "
-                              "que Docker lo levante con navegador fresco.", quieto)
+                    # QUE DICE Y QUE NO. La fase es el ultimo lugar por el
+                    # que paso el loop, no la causa: dice DONDE mirar. El
+                    # mensaje viejo nombraba una causa ("page.evaluate
+                    # colgado?") que un refactor habia dejado imposible, y
+                    # esa pista falsa costo una investigacion entera.
+                    log.error("WATCHDOG: el loop lleva %.0fs sin avanzar. "
+                              "Ultima fase: %s. Reinicio el proceso para que "
+                              "Docker lo levante con navegador fresco.",
+                              quieto, WD_FASE[0])
                     # DEVOLVER LO RECLAMADO ANTES DE MORIR. Sin esto quedan
                     # 'procesando' hasta el rescate de zombies -- 15 minutos
                     # en los que el jugador ve que su cuenta "tarda" y no hay
@@ -2399,7 +2419,7 @@ def main() -> int:
         aprendido: dict = {}     # se llena cuando el formulario ensena la plantilla
         try:
             while True:
-                _latir()   # "sigo vivo" para el watchdog
+                _latir("sondeando la cola de altas")
                 try:
                     lote = api.pendientes(args.lote)
                 except ErrorApi as e:
@@ -2450,7 +2470,7 @@ def main() -> int:
                     restantes = []
                     creados = 0
                     for reg in lote:
-                        _latir()   # el triage tambien avanza de a un item acotado
+                        _latir(f"triage del fast-path, alta {reg.get('id')}")
                         res, msg, gid = resultados.get(reg["id"], (None, "sin respuesta", None))
                         if res is True:
                             creados += 1
@@ -2535,7 +2555,7 @@ def main() -> int:
                         log.warning("  no pude liberar el excedente de formulario: %s", e)
 
                 for reg in lote:
-                    _latir()   # cada alta cuenta como avance
+                    _latir(f"formulario, alta {reg.get('id')}")
                     etiqueta = f"{reg.get('id')} / {reg.get('usuario')}"
                     log.info("Creando jugador %s", etiqueta)
                     try:

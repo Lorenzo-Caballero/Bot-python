@@ -128,6 +128,34 @@ chequear("y pasa SUS ids, no el liberar global", "api.liberar(mios" in wd)
 chequear("si no puede, lo dice y muere igual (no se cuelga)",
          "except Exception" in wd and "Vuelven solas en 15 min" in wd)
 
+# ---------------------------------------------------------------------------
+print("\n=== 5. El watchdog dice DONDE se colgo ===")
+"""El 7/10/2026 un cuelgue de 92s se reporto como "page.evaluate colgado?" --el
+   texto fijo del mensaje-- cuando el fast-path habia dejado de usar
+   page.evaluate un mes antes (6/9/2026, migrado a context.request). El unico
+   dato que daba el watchdog señalaba a un culpable imposible, y ubicar el
+   cuelgue de verdad costo reconstruirlo restando segundos entre dos lineas.
+
+   La fase dice DONDE estaba el loop, que es un hecho. La causa no la sabe
+   nadie en ese momento, y por eso el mensaje ya no la nombra."""
+B._latir("probando")
+chequear("el latido recuerda la fase", B.WD_FASE[0] == "probando", B.WD_FASE[0])
+B._latir()
+chequear("un latido sin fase no la borra (sigue siendo el ultimo lugar conocido)",
+         B.WD_FASE[0] == "probando", B.WD_FASE[0])
+
+chequear("el watchdog imprime la fase", "WD_FASE[0]" in wd)
+chequear("y ya no acusa a page.evaluate, que no se usa desde el 6/9/2026",
+         "page.evaluate colgado" not in wd,
+         "una pista falsa cuesta una investigacion entera")
+
+"""Las fases tienen que cubrir los caminos donde el alta puede colgarse: si
+   una queda sin etiquetar, el watchdog reporta la anterior y vuelve a
+   mandar a mirar al lugar equivocado."""
+for fase in ["sondeando la cola de altas", "fast-path: POST al panel",
+             "fast-path: armando el alta", "triage del fast-path", "formulario, alta"]:
+    chequear(f"hay fase para '{fase}'", fase in src)
+
 print("\n" + "-" * 39)
 print(f"{ok} OK, {fail} fallas")
 raise SystemExit(1 if fail else 0)
