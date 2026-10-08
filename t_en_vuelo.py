@@ -156,6 +156,90 @@ for fase in ["sondeando la cola de altas", "fast-path: POST al panel",
              "fast-path: armando el alta", "triage del fast-path", "formulario, alta"]:
     chequear(f"hay fase para '{fase}'", fase in src)
 
+# ---------------------------------------------------------------------------
+print("\n=== 6. El challenge del WAF se despeja en el NAVEGADOR ===")
+"""Medido el 7/10/2026: de las 21:23 en adelante, el WAF desafio el 100% de
+   las requests y los CINCO reintentos del fast-path fallaron, uno atras del
+   otro, en cada alta. Ninguno paso nunca.
+
+   La razon es que context.request NO EJECUTA JAVASCRIPT: lleva la cookie de
+   clearance que ya tiene, pero no puede conseguir una nueva -- y el challenge
+   de ServicePipe es exactamente una pagina con JS que hay que correr para
+   obtenerla. Dormir y reintentar manda la MISMA request sin cookie y recibe
+   el MISMO challenge. Mientras el WAF desafiaba de a ratos no se notaba; con
+   el 100%, las altas dejaron de salir (445 y 446 en 3-6s, de la 447 en
+   adelante ninguna)."""
+
+CHALLENGE = ('<!DOCTYPE html><html><head><meta http-equiv="Content-Type">'
+             '<noscript><meta http-equiv="refresh" content="0; url=/exhk123">')
+SANO = "<!DOCTYPE html><html><body>Crear jugador</body></html>"
+
+
+class PaginaFalsa:
+    """Un Chromium de mentira: cuenta los goto y decide que ve despues."""
+
+    def __init__(self, vistas, falla_goto=False):
+        self.vistas = list(vistas)     # que devuelve content() en cada llamada
+        self.gotos = 0
+        self.esperas = []
+        self.falla_goto = falla_goto
+
+    def goto(self, url, **kw):
+        self.gotos += 1
+        if self.falla_goto:
+            raise RuntimeError("Timeout 30000ms exceeded")
+
+    def wait_for_timeout(self, ms):
+        self.esperas.append(ms)
+
+    def content(self):
+        return self.vistas.pop(0) if self.vistas else SANO
+
+
+pag = PaginaFalsa([SANO])
+chequear("si el navegador ya no ve el challenge, queda despejado",
+         B.despejar_waf(pag) is True)
+chequear("y recarga el panel una sola vez", pag.gotos == 1, str(pag.gotos))
+
+"""Le tiene que dar tiempo REAL de correr el JS: si contesta al instante,
+   estaria diciendo que la cookie se renovo sin haber esperado a que pase."""
+chequear("espera antes de declararlo despejado", pag.esperas == [2500], str(pag.esperas))
+
+pag = PaginaFalsa([CHALLENGE, CHALLENGE])
+chequear("si el challenge sigue en pantalla, NO finge que se renovo",
+         B.despejar_waf(pag) is False)
+chequear("y lo reintenta con esperas crecientes antes de rendirse",
+         pag.esperas == [2500, 5000], str(pag.esperas))
+
+chequear("un goto que falla no tumba el alta (best-effort)",
+         B.despejar_waf(PaginaFalsa([], falla_goto=True)) is False)
+
+print("\n=== 7. Cuando se despeja y cuando no ===")
+loop = src[src.index("_WAF_INTENTOS = 5"):]
+loop = loop[:loop.index("except Exception as e:")]
+
+"""EL PRIMER REINTENTO ES GRATIS. Con el WAF desafiando de a ratos la request
+   siguiente pasa sola; pagar un goto de hasta 30s ahi seria cambiar un
+   problema de a ratos por una demora en todas."""
+chequear("no se despeja en el primer reintento",
+         "if _intento_waf >= 1 and despejar_waf(page):" in loop,
+         "despejar siempre costaria 30s en challenges que se van solos")
+
+"""Despues de despejar, reintentar YA: la cookie esta fresca y dormir encima
+   solo suma demora a un alta que el jugador esta esperando."""
+chequear("tras despejar reintenta sin dormir", "continue" in loop)
+chequear("y si no se pudo despejar, sigue la espera creciente de siempre",
+         "time.sleep(1.5 * (_intento_waf + 1))" in loop)
+
+"""LA GUARDA QUE HACE SEGURO REINTENTAR UNA ESCRITURA. Un alta es una
+   escritura: repetirla a ciegas crearia dos jugadores. Solo se reintenta
+   cuando es_challenge() dice que si, y un challenge PRUEBA que la request no
+   llego al backend."""
+chequear("solo se reintenta si es un challenge, nunca a ciegas",
+         "if not alta_api.es_challenge(txt) or _intento_waf == _WAF_INTENTOS - 1:" in loop
+         and loop.index("es_challenge(txt)") < loop.index("despejar_waf(page)"),
+         "sin esa guarda, reintentar un alta crea dos jugadores")
+
 print("\n" + "-" * 39)
 print(f"{ok} OK, {fail} fallas")
 raise SystemExit(1 if fail else 0)

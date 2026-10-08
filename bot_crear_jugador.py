@@ -1626,6 +1626,56 @@ def _mismo_endpoint(a: str, b: str) -> bool:
     return na == nb
 
 
+def despejar_waf(page) -> bool:
+    """Carga una pagina del panel para que el NAVEGADOR resuelva el challenge
+    y refresque la cookie de clearance. Devuelve si quedo despejado.
+
+    POR QUE ESPERAR NO ALCANZA, que es lo que se creia hasta el 7/10/2026.
+    `context.request` NO EJECUTA JAVASCRIPT: lleva la cookie de clearance que
+    ya tenga, pero no puede conseguir una nueva. El challenge de ServicePipe
+    es precisamente una pagina con JS que hay que correr para obtenerla. Asi
+    que dormir 1,5s y reintentar manda la MISMA request sin cookie y recibe el
+    MISMO challenge -- cinco veces, que es exactamente lo que mostraban los
+    logs de esa noche: nunca uno de los cinco pasaba.
+
+    Mientras el WAF desafiaba de a ratos no se notaba (la cookie vieja seguia
+    sirviendo y el reintento pegaba en una request no desafiada). Cuando paso
+    a desafiar el 100%, el alta dejo de salir por API y caia al formulario,
+    que cruza el MISMO WAF y tambien falla: 445 y 446 salieron en 3-6s, y de
+    la 447 en adelante no salio ninguna.
+
+    La pagina si es Chromium de verdad y comparte el almacen de cookies del
+    contexto: apenas resuelve el challenge, context.request vuelve a pasar. Es
+    el mismo mecanismo que _despejar_waf() de colector/aprobar_cargas.py, que
+    ya lo venia resolviendo del lado de las lecturas.
+
+    Best-effort y acotado: si no se puede, se devuelve False y el que llamo
+    reintenta igual o cae al formulario, como siempre.
+    """
+    import alta_api
+
+    try:
+        _latir("despejando el challenge del WAF en el navegador")
+        page.goto(PANEL_URL, wait_until="domcontentloaded", timeout=30_000)
+        # Hay que darle tiempo REAL de ejecutar el JS de clearance. Si el
+        # challenge sigue en pantalla no fingimos que la cookie se renovo.
+        for espera in (2500, 5000):
+            _latir("esperando que el navegador resuelva el challenge")
+            page.wait_for_timeout(espera)
+            try:
+                cuerpo = page.content()
+            except Exception:
+                cuerpo = ""
+            if cuerpo and not alta_api.es_challenge(cuerpo):
+                log.info("  WAF despejado en el navegador: la cookie quedo fresca")
+                return True
+        log.warning("  el navegador SIGUE viendo el challenge del WAF")
+        return False
+    except Exception as e:
+        log.info("  no pude despejar el challenge: %s", str(e)[:120])
+        return False
+
+
 def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> tuple[dict, list]:
     """Crea jugadores por la API del panel usando el APIRequestContext de
     Playwright (page.context.request), NO page.evaluate.
@@ -1731,10 +1781,18 @@ def crear_lote_por_fetch(page, plantilla: dict, regs: list[dict]) -> tuple[dict,
                 log.info("  fast-path %s / %s: challenge del WAF, reintento %s de %s",
                          reg.get("id"), reg.get("usuario"), _intento_waf + 1,
                          _WAF_INTENTOS - 1)
-                # ServicePipe deja la cookie de clearance en la respuesta del
-                # propio challenge y req comparte cookies con el navegador:
-                # una pausa suele alcanzar, y creciente le da aire al que
-                # viene persistente.
+                # EL PRIMER REINTENTO ES GRATIS: cuando el WAF desafia de a
+                # ratos, la request siguiente pasa sola y una pausa corta
+                # alcanza. No se paga un goto de hasta 30s por eso.
+                #
+                # DEL SEGUNDO EN ADELANTE, ESPERAR YA SE PROBO QUE NO SIRVE:
+                # dos challenges seguidos significan que la cookie de
+                # clearance esta vencida, y context.request no puede sacar
+                # una nueva porque no ejecuta JavaScript. Ahi se manda al
+                # navegador a resolverlo (ver despejar_waf) y se reintenta
+                # enseguida, sin dormir: la cookie ya esta fresca.
+                if _intento_waf >= 1 and despejar_waf(page):
+                    continue
                 time.sleep(1.5 * (_intento_waf + 1))
         except Exception as e:
             # Timeout / red / sesion: NO se da por creado. Al formulario, que
