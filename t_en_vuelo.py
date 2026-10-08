@@ -240,6 +240,36 @@ chequear("solo se reintenta si es un challenge, nunca a ciegas",
          and loop.index("es_challenge(txt)") < loop.index("despejar_waf(page)"),
          "sin esa guarda, reintentar un alta crea dos jugadores")
 
+# ---------------------------------------------------------------------------
+print("\n=== 8. El login rechazado enfria, no machaca ===")
+"""ESPERA_LOGIN_FALLIDO se USABA sin estar definida. O sea que el camino que
+   existe para FRENAR el bucle de reinicios terminaba en NameError: el proceso
+   moria, Docker lo levantaba, y el login se machacaba de nuevo -- justo lo
+   contrario de lo que el sleep venia a hacer. Y solo se dispara cuando la
+   clave esta mal, que es cuando menos conviene martillar el panel.
+
+   Estaba arreglado en scripts/parche-login-waf.py, que parchea el CONTENEDOR:
+   eso se pierde en el proximo build. Por eso vive aca."""
+chequear("ESPERA_LOGIN_FALLIDO existe", hasattr(B, "ESPERA_LOGIN_FALLIDO"))
+chequear("con un default de 15 minutos", B.ESPERA_LOGIN_FALLIDO == 900,
+         str(getattr(B, "ESPERA_LOGIN_FALLIDO", None)))
+chequear("y con piso, para que nadie lo deje en 0 y vuelva el bucle",
+         "max(300, int(os.environ.get(\"ESPERA_LOGIN_FALLIDO\"" in src)
+
+print("\n=== 9. El login tambien cruza el WAF ===")
+"""Con 15s de timeout no entraba: Chromium necesita resolver el challenge
+   antes de que cargue la pagina, y el proceso se reiniciaba en el medio."""
+# El bloque del login y nada mas: el archivo tiene otras navegaciones a
+# LOGIN_URL mas abajo, y un recorte largo las cuenta como si fueran esta.
+login = src[src.index("EL LOGIN TAMBIEN CRUZA EL WAF"):]
+login = login[:login.index("tipear(page, SEL_LOGIN")]
+chequear("el goto del login tiene 45s", "timeout=45_000" in login)
+chequear("y si no entra, despeja el WAF y reintenta UNA vez",
+         "despejar_waf(page)" in login and login.count("page.goto(LOGIN_URL") == 2)
+chequear("si tampoco alcanza, la excepcion sube (no sigue como si hubiera entrado)",
+         "raise" in login,
+         "seguir de largo sin sesion crearia altas contra una pagina de login")
+
 print("\n" + "-" * 39)
 print(f"{ok} OK, {fail} fallas")
 raise SystemExit(1 if fail else 0)

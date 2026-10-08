@@ -161,6 +161,22 @@ except ValueError:
     MAX_FORM_POR_VUELTA = 8
 
 
+# ENFRIAMIENTO CUANDO EL PANEL RECHAZA LAS CREDENCIALES.
+#
+# Se USABA sin estar definida (lineas del login rechazado), asi que el camino
+# que existe para FRENAR el bucle de reinicios terminaba en NameError: el
+# proceso moria, Docker lo levantaba, y el login volvia a machacarse enseguida
+# -- exactamente lo que el sleep venia a evitar. Y solo pasa cuando la clave
+# esta mal, que es el momento en que menos conviene martillar el panel.
+#
+# El valor sale del env para poder bajarlo en una prueba; el piso de 300s
+# existe para que nadie lo deje en 0 y vuelva el bucle.
+try:
+    ESPERA_LOGIN_FALLIDO = max(300, int(os.environ.get("ESPERA_LOGIN_FALLIDO", "900")))
+except ValueError:
+    ESPERA_LOGIN_FALLIDO = 900
+
+
 # ---------------------------------------------------------------------------
 # Latido del watchdog (el hilo _watchdog del main lo vigila).
 #
@@ -892,7 +908,19 @@ def login_automatico(page) -> bool:
 def _login_con(page, user: str, clave: str) -> bool:
     """UN intento de login con estas credenciales. False si no entro."""
     log.info("Logueando como %s ...", user)
-    page.goto(LOGIN_URL, wait_until="domcontentloaded")
+    # EL LOGIN TAMBIEN CRUZA EL WAF, y con 15s de timeout no llegaba: Chromium
+    # necesita resolver el challenge antes de que cargue la pagina, y el
+    # proceso se reiniciaba en el medio. 45s le dan aire; si aun asi no
+    # entra, se manda al navegador a despejar el challenge y se reintenta UNA
+    # vez. Si eso tampoco alcanza, la excepcion sube como siempre: nunca se
+    # sigue de largo como si hubiera logueado.
+    try:
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45_000)
+    except PWTimeout:
+        log.warning("  el login supero 45 s; intento despejar el WAF en Chromium")
+        if not despejar_waf(page):
+            raise
+        page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=45_000)
 
     try:
         tipear(page, SEL_LOGIN["usuario"] + " >> nth=0", user)
