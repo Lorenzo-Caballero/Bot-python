@@ -46,9 +46,17 @@ def main() -> int:
     sufijo = random.randint(100000, 999999)
     usuario = f"testio{sufijo}"
     clave = "Prueba1234x"
+    # Payload SUPERSET que cubre las DOS versiones del panel que vimos:
+    #  - la vieja (ganamosonline/ganamos.io): firstName/lastName/confirmPassword
+    #  - la nueva (ganamos.co/.net/.bet/ganamos1): first_name/last_name + role:0
+    # El bundle del panel nuevo confirma role 0 = player (6 = agent). Los campos
+    # de mas los ignora cada backend; asi un solo payload crea en cualquiera.
     cuerpo = json.dumps({
         "username": usuario, "password": clave, "confirmPassword": clave,
-        "email": f"{usuario}@goldpaw.game", "firstName": "Prueba", "lastName": "Dominio",
+        "email": f"{usuario}@goldpaw.game",
+        "firstName": "Prueba", "lastName": "Dominio",
+        "first_name": "Prueba", "last_name": "Dominio",
+        "role": 0,
     }, ensure_ascii=False)
 
     print(f"Probando ESCRITURA (POST a la API) en {host}")
