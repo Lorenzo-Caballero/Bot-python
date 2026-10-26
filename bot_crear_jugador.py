@@ -260,21 +260,22 @@ def guardar_plantilla(pl: dict) -> None:
 # ---------------------------------------------------------------------------
 # DESTINO
 # ---------------------------------------------------------------------------
-# agents.ganamosonline.com: el panel probado meses (altas y depositos). El .env
-# de cada contenedor manda sobre estos defaults, asi que en produccion esto casi
-# no se usa -- pero es el que corre en un arranque manual sin .env, y por eso
-# NO puede ser agents.ganamos7.com: a ese dominio se le vencio el cert TLS el
-# 22/10/2026 (es de la plataforma, no lo renovamos) y el bot muere con
-# ERR_CERT_DATE_INVALID. Los challenges del WAF de ganamosonline los maneja
-# despejar_waf(). Ver scripts/arreglar-bot-altas.sh para la historia completa.
+# agents.ganamos.io: el dominio PRINCIPAL desde el 25/10/2026 -- el que menos
+# molesta el WAF (sin Bot Fight Mode) y con el cert mas largo, con alta probada
+# (probar_alta.py). El .env de cada contenedor manda sobre este default, y lo
+# escribe scripts/arreglar-bot-altas.sh, que ademas elige por FAILOVER: si al
+# dominio preferido se le vence el cert (lo que nos tumbo con ganamos7), salta
+# solo al siguiente (ganamosbet.net -> ganamosonline). Este default es solo el
+# arranque manual sin .env; NO debe ser ganamos7 (cert vencido 22/10).
+# Ver scripts/arreglar-bot-altas.sh para la lista y la historia completa.
 PANEL_URL = os.environ.get(
-    "PANEL_URL", "https://agents.ganamosonline.com/user/create-player"
+    "PANEL_URL", "https://agents.ganamos.io/user/create-player"
 )
 # La pantalla de login vive en la RAIZ, no en /login: el panel es un SPA y esa
 # ruta no existe (te deja en una pagina sin el campo de password, y el bot falla
 # con "No encontre los campos del login"). Mismo motivo por el que
 # es_pantalla_login() busca el boton 'Acceder' en vez de mirar la URL.
-LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamosonline.com/")
+LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamos.io/")
 
 # Host del panel: se usa para distinguir el POST real de la telemetria.
 #
