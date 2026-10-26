@@ -260,19 +260,21 @@ def guardar_plantilla(pl: dict) -> None:
 # ---------------------------------------------------------------------------
 # DESTINO
 # ---------------------------------------------------------------------------
-# agents.ganamos7.com desde el 16/09/2026 (decision del dueño): es EL MISMO
-# panel que agents.ganamosonline.com (probado a mano: misma cuenta, mismo
-# saldo, mismos jugadores) pero servido por nginx pelado, sin el Cloudflare
-# que tiraba challenges intermitentes y trabo altas y depositos. El .env de
-# cada contenedor manda sobre estos defaults.
+# agents.ganamosonline.com: el panel probado meses (altas y depositos). El .env
+# de cada contenedor manda sobre estos defaults, asi que en produccion esto casi
+# no se usa -- pero es el que corre en un arranque manual sin .env, y por eso
+# NO puede ser agents.ganamos7.com: a ese dominio se le vencio el cert TLS el
+# 22/10/2026 (es de la plataforma, no lo renovamos) y el bot muere con
+# ERR_CERT_DATE_INVALID. Los challenges del WAF de ganamosonline los maneja
+# despejar_waf(). Ver scripts/arreglar-bot-altas.sh para la historia completa.
 PANEL_URL = os.environ.get(
-    "PANEL_URL", "https://agents.ganamos7.com/user/create-player"
+    "PANEL_URL", "https://agents.ganamosonline.com/user/create-player"
 )
 # La pantalla de login vive en la RAIZ, no en /login: el panel es un SPA y esa
 # ruta no existe (te deja en una pagina sin el campo de password, y el bot falla
 # con "No encontre los campos del login"). Mismo motivo por el que
 # es_pantalla_login() busca el boton 'Acceder' en vez de mirar la URL.
-LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamos7.com/")
+LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamosonline.com/")
 
 # Host del panel: se usa para distinguir el POST real de la telemetria.
 #
