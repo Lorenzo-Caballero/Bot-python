@@ -246,6 +246,42 @@ def cargar_plantilla() -> dict | None:
     return None
 
 
+def plantilla_superset() -> dict:
+    """Plantilla de fast-path que crea en LOS DOS builds del panel, sin aprender
+    nada del formulario.
+
+    Hay dos versiones del panel dando vueltas (medido 26/10/2026):
+      * build VIEJO (ganamosonline, ganamos.io, ganamosbet.net): el alta quiere
+        username/password/confirmPassword/email/firstName/lastName.
+      * build NUEVO (ganamos.co, ganamos1.com, ganamos.net, ganamos.bet): quiere
+        first_name/last_name (snake_case) y ADEMAS role (0 = player, 6 = agent;
+        confirmado leyendo el bundle del panel). Sin role contesta
+        422 "role - Field required".
+
+    Este cuerpo manda TODO: cada backend usa lo suyo e ignora el resto (probado:
+    ganamosonline crea igual con este payload). Asi el fast-path no depende de
+    aprender la plantilla tipeando el formulario -- que encima tiene DOM
+    distinto entre builds -- y puede crear en cualquier dominio del failover
+    apenas se cambia a el.
+
+    Se usa como RESPALDO: si hay una plantilla aprendida se respeta esa (es la
+    que ya venia creando); esta entra cuando no hay ninguna -- por ejemplo justo
+    despues de un failover, que resetea la aprendida (ver endpoint horneado)."""
+    cuerpo = ('{"username":"{{usuario}}","password":"{{password}}",'
+              '"confirmPassword":"{{password}}","email":"{{email}}",'
+              '"firstName":"{{nombre}}","lastName":"{{apellido}}",'
+              '"first_name":"{{nombre}}","last_name":"{{apellido}}","role":0}')
+    return {
+        "metodo": "POST",
+        "url": f"{PANEL_API}/agent_admin/user/",
+        "content_type": "application/json",
+        "es_json": True,
+        "cuerpo": cuerpo,
+        "campos": ["usuario", "password", "email", "nombre", "apellido"],
+        "superset": True,   # marca: no se aprendio, es la de respaldo
+    }
+
+
 def guardar_plantilla(pl: dict) -> None:
     """Persistir la plantilla aprendida. Best-effort: no poder guardarla solo
     significa re-aprenderla el proximo arranque, no un alta perdida."""
@@ -2438,13 +2474,18 @@ def main() -> int:
         # lote entero sale en ~1s; sin ella, la primera alta la aprende del
         # formulario y a partir de la segunda vuela.
         plantilla = cargar_plantilla() if FAST_ON else None
+        # Sin plantilla aprendida (p.ej. recien despues de un failover, que la
+        # resetea) se arranca con la SUPERSET: crea en cualquier build sin tener
+        # que aprender del formulario primero. Si el dominio nuevo ensena una
+        # plantilla propia por el formulario, esa la reemplaza despues.
+        if FAST_ON and not plantilla:
+            plantilla = plantilla_superset()
         if not FAST_ON:
             log.info("Fast-path APAGADO (ALTA_FAST=0): todo por formulario.")
-        elif plantilla:
-            log.info("Fast-path ON: creo por API en paralelo (plantilla ya aprendida).")
+        elif plantilla.get("superset"):
+            log.info("Fast-path ON: con plantilla SUPERSET (sirve en los dos builds del panel).")
         else:
-            log.info("Fast-path ON: sin plantilla todavia; la aprendo del primer "
-                     "alta por formulario.")
+            log.info("Fast-path ON: creo por API en paralelo (plantilla ya aprendida).")
 
         # WATCHDOG. page.evaluate (el fast-path) es BLOQUEANTE y Playwright no le
         # pone timeout: si la pagina del navegador queda en mal estado, evaluate

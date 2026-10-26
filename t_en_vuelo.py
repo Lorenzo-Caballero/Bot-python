@@ -270,6 +270,40 @@ chequear("si tampoco alcanza, la excepcion sube (no sigue como si hubiera entrad
          "raise" in login,
          "seguir de largo sin sesion crearia altas contra una pagina de login")
 
+import json as _json
+print("\n=== 10. Plantilla SUPERSET: crea en los dos builds del panel ===")
+"""Hay dos versiones del panel: la vieja (firstName/lastName/confirmPassword) y
+   la nueva (first_name/last_name + role:0). El fast-path usa esta plantilla
+   cuando no hay una aprendida (p.ej. tras un failover), para crear en cualquier
+   dominio sin depender del formulario. Manda el SUPERSET: cada backend usa lo
+   suyo e ignora el resto."""
+import alta_api as _A
+_pl = B.plantilla_superset()
+_body = _A.render_cuerpo(_pl, {"usuario": "holaAna1", "password": "Pass1234x",
+                               "email": "a@goldpaw.game", "nombre": "Ana", "apellido": "Gomez"})
+try:
+    _d = _json.loads(_body)
+    _ok_json = True
+except Exception:
+    _d = {}; _ok_json = False
+chequear("el cuerpo renderizado es JSON valido", _ok_json, _body)
+chequear("manda role:0 (build nuevo lo exige; 0 = player)", _d.get("role") == 0)
+chequear("manda first_name/last_name (snake, build nuevo)",
+         _d.get("first_name") == "Ana" and _d.get("last_name") == "Gomez")
+chequear("y firstName/lastName (camel, build viejo)",
+         _d.get("firstName") == "Ana" and _d.get("lastName") == "Gomez")
+chequear("username y password quedan bien",
+         _d.get("username") == "holaAna1" and _d.get("password") == "Pass1234x")
+chequear("confirmPassword == password (build viejo)",
+         _d.get("confirmPassword") == _d.get("password"))
+chequear("la URL apunta al endpoint de alta del panel actual",
+         str(_pl.get("url", "")).endswith("/api/agent_admin/user/"))
+chequear("queda marcada como superset (no aprendida)", _pl.get("superset") is True)
+# El fast-path la usa cuando no hay aprendida: el loop cae a plantilla_superset()
+_src = open(B.__file__.replace(".pyc", ".py"), encoding="utf-8").read()
+chequear("el loop usa la superset cuando no hay plantilla aprendida",
+         "if FAST_ON and not plantilla:" in _src and "plantilla = plantilla_superset()" in _src)
+
 print("\n" + "-" * 39)
 print(f"{ok} OK, {fail} fallas")
 raise SystemExit(1 if fail else 0)
