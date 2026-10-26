@@ -1,5 +1,5 @@
 """
-Bot de creacion automatica de jugadores en el panel de agentes (agents.ganamos7.com desde el 16/09/2026)
+Bot de creacion automatica de jugadores en el panel de agentes (agents.ganamosonline.com desde el 25/10/2026; ganamos7 quedo con el cert TLS vencido)
 
 Flujo:
     login.php -> tabla jugadores -> cola_panel.php -> este bot -> panel
@@ -39,8 +39,8 @@ Operacion:
 Archivo .env (esta en .gitignore, no subirlo):
     API_URL=https://ganamoscrm.online/gp-api/altas_cola.php
     API_KEY=una-clave-larga-y-random
-    PANEL_URL=https://agents.ganamos7.com/user/create-player
-    LOGIN_URL=https://agents.ganamos7.com/
+    PANEL_URL=https://agents.ganamosonline.com/user/create-player
+    LOGIN_URL=https://agents.ganamosonline.com/
     PANEL_USER=...
     PANEL_PASS=...
     POLL_SEGUNDOS=30
