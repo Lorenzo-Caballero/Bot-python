@@ -260,22 +260,21 @@ def guardar_plantilla(pl: dict) -> None:
 # ---------------------------------------------------------------------------
 # DESTINO
 # ---------------------------------------------------------------------------
-# agents.ganamos.io: el dominio PRINCIPAL desde el 25/10/2026 -- el que menos
-# molesta el WAF (sin Bot Fight Mode) y con el cert mas largo, con alta probada
-# (probar_alta.py). El .env de cada contenedor manda sobre este default, y lo
-# escribe scripts/arreglar-bot-altas.sh, que ademas elige por FAILOVER: si al
-# dominio preferido se le vence el cert (lo que nos tumbo con ganamos7), salta
-# solo al siguiente (ganamosbet.net -> ganamosonline). Este default es solo el
-# arranque manual sin .env; NO debe ser ganamos7 (cert vencido 22/10).
-# Ver scripts/arreglar-bot-altas.sh para la lista y la historia completa.
+# agents.ganamosonline.com: el dominio PRINCIPAL. Se probo ganamos.io el
+# 25/10/2026 ("menos WAF" por curl pelado) y bajo la RAFAGA del bot real tiraba
+# el challenge de ServicePipe en cada POST y trababa las altas -- curl 200 no
+# predice la carga. ganamosonline es el unico probado funcionando bajo carga;
+# sus challenges los maneja despejar_waf(). El .env manda sobre este default, y
+# arreglar-bot-altas.sh elige por FAILOVER (cert + emisor auto-renovable); este
+# default es solo el arranque manual sin .env. Ver ese script para la historia.
 PANEL_URL = os.environ.get(
-    "PANEL_URL", "https://agents.ganamos.io/user/create-player"
+    "PANEL_URL", "https://agents.ganamosonline.com/user/create-player"
 )
 # La pantalla de login vive en la RAIZ, no en /login: el panel es un SPA y esa
 # ruta no existe (te deja en una pagina sin el campo de password, y el bot falla
 # con "No encontre los campos del login"). Mismo motivo por el que
 # es_pantalla_login() busca el boton 'Acceder' en vez de mirar la URL.
-LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamos.io/")
+LOGIN_URL = os.environ.get("LOGIN_URL", "https://agents.ganamosonline.com/")
 
 # Host del panel: se usa para distinguir el POST real de la telemetria.
 #
