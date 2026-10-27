@@ -2012,7 +2012,30 @@ ARGS_CHROMIUM = [
     "--disable-blink-features=AutomationControlled",
     "--no-sandbox",
     "--disable-dev-shm-usage",
+    # Flags para que Chromium consuma menos y aguante mas horas sin degradarse
+    # hasta el crash "Connection closed while reading from the driver" (27/10).
+    # Nada de esto cambia lo que ve el panel: es un navegador headless creando
+    # cuentas, no necesita GPU, audio, extensiones ni actividad en segundo plano.
+    "--disable-gpu",
+    "--disable-extensions",
+    "--mute-audio",
+    "--disable-background-networking",
+    "--disable-renderer-backgrounding",
+    "--disable-backgrounding-occluded-windows",
 ]
+
+# RECICLADO PREVENTIVO. Chromium abierto muchas horas crece en memoria hasta que
+# el contenedor lo mata o el driver se cae (el crash del 27/10: el fast-path
+# fallo, cayo al formulario sobre el navegador muerto y se colgo 103s hasta que
+# el watchdog reinicio). En vez de esperar ese crash, se reinicia SOLO cada
+# RECICLAR_MIN minutos -- pero unicamente cuando la cola esta vacia y no hay
+# altas en vuelo, asi no interrumpe ningun trabajo. Docker lo levanta con un
+# navegador fresco (mismo camino que el watchdog, pero planeado y sin costo).
+try:
+    RECICLAR_SEG = max(0, int(os.environ.get("RECICLAR_MIN", "120"))) * 60
+except ValueError:
+    RECICLAR_SEG = 120 * 60
+_PROCESO_DESDE = time.monotonic()
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -2821,6 +2844,18 @@ def main() -> int:
                     if ahora - ultimo_latido >= 600:
                         ultimo_latido = ahora
                         log.info("escuchando (cola vacia, sondeo cada %.0fs)", espera)
+
+                    # RECICLADO PREVENTIVO: proceso viejo + cola vacia + nada en
+                    # vuelo = momento ideal para arrancar de cero. Reiniciar aca
+                    # no le cuesta a nadie (no hay altas esperando) y evita que
+                    # el navegador envejezca hasta el crash. Salida limpia (exit
+                    # 0); Docker lo levanta con Chromium fresco.
+                    if (RECICLAR_SEG and not EN_VUELO
+                            and time.monotonic() - _PROCESO_DESDE >= RECICLAR_SEG):
+                        log.info("Reciclado preventivo: %.0f min de proceso y cola "
+                                 "vacia. Reinicio para arrancar con navegador fresco.",
+                                 (time.monotonic() - _PROCESO_DESDE) / 60)
+                        os._exit(0)
 
                 if espera > 0:
                     time.sleep(espera)

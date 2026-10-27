@@ -304,6 +304,30 @@ _src = open(B.__file__.replace(".pyc", ".py"), encoding="utf-8").read()
 chequear("el loop usa la superset cuando no hay plantilla aprendida",
          "if FAST_ON and not plantilla:" in _src and "plantilla = plantilla_superset()" in _src)
 
+print("\n=== 11. Reciclado preventivo del navegador ===")
+"""El crash del 27/10 ("Connection closed while reading from the driver") fue
+   Chromium degradado por horas abierto. Prevencion: reiniciar SOLO cada
+   RECICLAR_MIN, pero unicamente con la cola vacia y nada en vuelo -- asi no
+   interrumpe ningun alta y el navegador nunca envejece hasta el crash."""
+chequear("RECICLAR_SEG configurado (default 120 min)", B.RECICLAR_SEG == 120 * 60)
+chequear("flags de Chromium para menos consumo",
+         "--disable-gpu" in B.ARGS_CHROMIUM and "--disable-extensions" in B.ARGS_CHROMIUM)
+chequear("--disable-dev-shm-usage sigue (crash clasico en Docker)",
+         "--disable-dev-shm-usage" in B.ARGS_CHROMIUM)
+# El guard del reciclado: solo con cola vacia Y nada en vuelo Y proceso viejo.
+_rec = _src[_src.index("RECICLADO PREVENTIVO: proceso viejo"):]
+_rec = _rec[:_rec.index("os._exit(0)") + len("os._exit(0)")]
+chequear("recicla solo si NO hay altas en vuelo",
+         "not EN_VUELO" in _rec,
+         "reciclar con algo en vuelo tiraria altas a medio crear")
+chequear("recicla solo pasado RECICLAR_SEG",
+         "_PROCESO_DESDE >= RECICLAR_SEG" in _rec)
+chequear("sale limpio (exit 0), Docker lo levanta fresco", "os._exit(0)" in _rec)
+# Y esta en la rama idle (cola vacia): el bloque del reciclado vive dentro del
+# else del sondeo, despues del log "escuchando (cola vacia)".
+chequear("el reciclado esta en la rama de cola vacia",
+         _src.index("escuchando (cola vacia") < _src.index("RECICLADO PREVENTIVO: proceso viejo"))
+
 print("\n" + "-" * 39)
 print(f"{ok} OK, {fail} fallas")
 raise SystemExit(1 if fail else 0)
